@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(clasp push *)",
+      "Bash(clasp login *)"
+    ]
+  },
+  "outputStyle": "Explanatory",
+  "spinnerTipsEnabled": true,
+  "prefersReducedMotion": false
+}
