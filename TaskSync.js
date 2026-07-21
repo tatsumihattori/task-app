@@ -193,6 +193,9 @@ function _syncCalendarToSheetsBody() {
 
   // 担当者マスタの全カレンダーからイベントを収集
   const calendarMap = _getAssigneeCalendarMap();
+  if (calendarMap.size === 0) {
+    throw new Error("担当者マスタが空、またはシートが見つかりません。Calendar→Sheets同期を中断しました。");
+  }
   const uniqueCalIds = [...new Set(calendarMap.values())];
 
   // calendarId → 担当者名 の逆引きマップ（タイトルに @名前 がない場合のフォールバック）
@@ -247,11 +250,11 @@ function _syncCalendarToSheetsBody() {
     const event       = entry.event;
     const sourceCalId = entry.sourceCalId;
     const eventId     = event.getId();
-    const newTaskName = event.getTitle();
+    const newTaskName = _sanitizeForSheet(event.getTitle());
     const newStart    = _formatDateTime(event.getStartTime());
     const newEnd      = _formatDateTime(event.getEndTime());
     const assignee    = calIdToAssignee.get(sourceCalId) || "";
-    const memo        = (event.getDescription() || "").trim();
+    const memo        = _sanitizeForSheet((event.getDescription() || "").trim());
     const creator     = event.getCreators()[0] || "Calendar";
     // イベント色がSTATUS_COLORSに対応している場合のみステータスを更新
     const eventColor = String(event.getColor());
@@ -627,4 +630,13 @@ function _formatDateTime(date) {
   const h  = String(d.getHours()).padStart(2, "0");
   const mi = String(d.getMinutes()).padStart(2, "0");
   return y + "/" + mo + "/" + dy + " " + h + ":" + mi;
+}
+
+/**
+ * Calendar由来の文字列がSheets上で数式として評価されないよう、
+ * 先頭が =+-@ の場合は ' を付与してテキスト扱いにする（数式インジェクション対策）
+ */
+function _sanitizeForSheet(value) {
+  if (typeof value !== "string") return value;
+  return /^[=+\-@]/.test(value) ? "'" + value : value;
 }
