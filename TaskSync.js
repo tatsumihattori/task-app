@@ -805,6 +805,17 @@ function debugCheckWriteSideColor(calendarId, eventId) {
 }
 
 /**
+ * 【調査用・一時関数】Apps Scriptエディタの「実行」ボタンは引数なしで関数を呼ぶため、
+ * debugCheckWriteSideColor() を直接実行できない。この関数を代わりに実行する。
+ */
+function debugCheckWriteSideColor_run() {
+  debugCheckWriteSideColor(
+    "c_60e6f80451cdf1045be018eff7cfa2fbe19fac4bc8dec036d29c8701eb9df4fe@group.calendar.google.com",
+    "oaae70adugeb2rcaqc7ql4bhtc@google.com"
+  );
+}
+
+/**
  * 指定カレンダーの labelProperties.eventLabels を取得し、labelId → labelName の Map を返す。
  * cache（calendarId → Map）で同一実行内の再取得を避ける。取得失敗時は空のMapを返す。
  */
