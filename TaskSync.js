@@ -775,6 +775,30 @@ function _getEventColorIdViaAdvancedService(calendarId, eventId) {
 }
 
 /**
+ * 【調査用・一時関数】Issue #32: eventLabelId移行の可否を実機検証するための診断関数。
+ * 指定イベントを colorId/eventLabelId 付きで取得し、eventLabelVersion パラメータの有無による差もログに出す。
+ * Calendar UIで手動色変更した直後に実行し、実行ログ（表示 > 実行数 / ログ）を確認する。
+ * 判断がついたら削除するか恒久実装に置き換える（Issue #32参照）。
+ */
+function debugEventColorAndLabel(calendarId, eventId) {
+  const rawEventId = eventId.split("@")[0];
+
+  try {
+    const ev = Calendar.Events.get(calendarId, rawEventId, { fields: "id,summary,colorId,eventLabelId" });
+    Logger.log("[通常] " + JSON.stringify(ev));
+  } catch(e) {
+    Logger.log("[通常] 取得エラー: " + e.message);
+  }
+
+  try {
+    const ev = Calendar.Events.get(calendarId, rawEventId, { fields: "id,summary,colorId,eventLabelId", eventLabelVersion: 1 });
+    Logger.log("[eventLabelVersion=1] " + JSON.stringify(ev));
+  } catch(e) {
+    Logger.log("[eventLabelVersion=1] 取得エラー: " + e.message);
+  }
+}
+
+/**
  * 複数カレンダーIDからイベントIDを検索し、最初に見つかった { calendar, event } を返す
  * 見つからなければ null
  */
