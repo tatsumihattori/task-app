@@ -62,6 +62,7 @@ C列は `_getAssigneeChatUserMap()` で読み込み、Google Chat期日通知で
 - `notifyUpcomingDeadlines()`（毎日9時、時間ベーストリガー）→ `_notifyUpcomingDeadlinesBody()` が本体
 - Webhook URLは**ソースコードには書かない**。Apps Scriptエディタの「プロジェクトの設定 > スクリプト プロパティ」で `CHAT_WEBHOOK_URL` を設定する（`key`/`token` を含む実質的な認証情報のため）。未設定の場合は通知をスキップするだけでエラーにはならない
 - 担当者マスタC列（ChatユーザーID）が設定されていれば `<users/xxxx>` 形式で本文に埋め込み、Chatが実際のメンション（通知）として扱う。未設定なら担当者名をテキストとして含めるだけ
+- 通知は**タスク単位ではなく担当者単位**で1メッセージにまとめて送信する（同じ担当者の対象タスクが複数あっても1通）。タスクは期日の近い順に並べる
 - 重複通知の抑制は行っていない。期日が通知範囲（`CHAT_NOTIFY_DAYS_BEFORE`日前〜当日）に入っている間は毎日通知される（意図的な仕様。小規模運用のため簡略化）
 - ステータスが「完了」「キャンセル」のタスクは通知対象外
 
@@ -114,6 +115,16 @@ GASの CalendarApp 経由では、UIで手動変更したイベント色を `get
 1. 新担当者のカレンダーでEventIDを検索
 2. 見つからなければ `_findEventInCalendars` で全カレンダーを検索
 3. 旧カレンダーのイベントを削除 → 新カレンダーに再作成
+
+### 4. CalendarApp由来のEvent IDをAdvanced Serviceにそのまま渡すと失敗する
+
+**症状**: `_getEventColorIdViaAdvancedService()` を実装したのに、Calendar側で手動変更した色が一向にSheetsへ反映されない。
+
+**原因**: `CalendarApp`（`event.getId()`）が返すEvent IDは `"xxxxx@google.com"` という末尾付きの形式。一方、Calendar Advanced Service（REST API）の `Calendar.Events.get()` はこの末尾を含まない素のIDを期待するため、そのまま渡すと404エラーになる。`catch` で例外を握りつぶしてログに出すだけの実装だったため、常に失敗していることに気づきにくかった。
+
+**解決策**: `eventId.split("@")[0]` で末尾を取り除いてからAdvanced Serviceに渡す。
+
+→ **CalendarAppのEvent IDをAdvanced Service（またはCalendar API）に渡す処理を新しく書くときは、必ずこの変換を思い出すこと。**
 
 ## 既知の未対応課題
 
