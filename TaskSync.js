@@ -796,6 +796,13 @@ function debugEventColorAndLabel(calendarId, eventId) {
   } catch(e) {
     Logger.log("[eventLabelVersion=1] 取得エラー: " + e.message);
   }
+
+  try {
+    const cal = Calendar.Calendars.get(calendarId, { fields: "labelProperties" });
+    Logger.log("[labelProperties] " + JSON.stringify(cal.labelProperties));
+  } catch(e) {
+    Logger.log("[labelProperties] 取得エラー: " + e.message);
+  }
 }
 
 /**
