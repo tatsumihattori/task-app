@@ -258,6 +258,11 @@ function _syncCalendarToSheetsBody() {
     colorToStatus.set(CONFIG.STATUS_COLORS[s], s);
   });
 
+  // ラベル名の妥当性チェック用（ラベル名はSTATUS_COLORSのキーと完全一致する運用が前提。CLAUDE.md参照）
+  const validStatuses  = new Set(Object.keys(CONFIG.STATUS_COLORS));
+  // calendarId → (labelId → labelName) キャッシュ（同一実行内で同じカレンダーのラベル情報を再取得しない）
+  const labelNameCache = new Map();
+
   let addedCount   = 0;
   let updatedCount = 0;
   const pendingUpdates = []; // { rowNum, values }[]
@@ -274,15 +279,29 @@ function _syncCalendarToSheetsBody() {
     const assignee    = calIdToAssignee.get(sourceCalId) || "";
     const memo        = _sanitizeForSheet(_extractMemoFromDescription(event.getDescription() || "").trim());
     const creator     = event.getCreators()[0] || "Calendar";
-    // イベント色がSTATUS_COLORSに対応している場合のみステータスを更新
-    // CalendarApp.getColor() はUIで手動変更した色を返さない（空文字になる）ため、
-    // その場合のみ Calendar Advanced Service で実際の colorId を取得する（1件ずつAPI呼び出しになるため、必要な場合のみ実行）
-    let eventColor = String(event.getColor());
-    if (!colorToStatus.has(eventColor)) {
-      eventColor = _getEventColorIdViaAdvancedService(sourceCalId, eventId) || eventColor;
+    // ステータス判定: まずCalendarApp（追加API呼び出し不要）の色で判定を試みる。
+    // 判定できない場合のみ Advanced Service で colorId と eventLabelId をまとめて取得する。
+    // eventLabelId はCalendarの「ラベル」機能に対応し、UIでの手動変更を確実に反映するため colorId より優先する
+    // （実機検証で colorId は手動変更後に欠落・不一致することがあったが eventLabelId は常に反映されていた）。
+    let newStatus  = colorToStatus.get(String(event.getColor())) || null;
+    let resolvedBy = newStatus ? "CalendarApp色" : null;
+
+    if (newStatus === null) {
+      const adv = _getEventColorAndLabelViaAdvancedService(sourceCalId, eventId);
+      if (adv.eventLabelId) {
+        const labelName = _getLabelNameMap(sourceCalId, labelNameCache).get(adv.eventLabelId);
+        if (labelName && validStatuses.has(labelName)) {
+          newStatus  = labelName;
+          resolvedBy = "ラベル(" + labelName + ")";
+        }
+      }
+      if (newStatus === null && adv.colorId && colorToStatus.has(adv.colorId)) {
+        newStatus  = colorToStatus.get(adv.colorId);
+        resolvedBy = "colorId(" + adv.colorId + ")";
+      }
     }
-    Logger.log("色確認: [" + event.getTitle() + "] color=" + eventColor + " → " + (colorToStatus.get(eventColor) || "(未対応)"));
-    const newStatus   = colorToStatus.get(eventColor) || null;
+
+    Logger.log("色確認: [" + event.getTitle() + "] " + (resolvedBy ? resolvedBy + " → " + newStatus : "(未対応)"));
 
     if (eventIdToEntry.has(eventId)) {
       // ---- 既存行：差分チェック（読み取り済みデータを使用） ----
@@ -757,52 +776,39 @@ function _getAssigneeChatUserMap() {
 }
 
 /**
- * Calendar Advanced Service (REST API) でイベントの colorId を取得する。
- * CalendarApp.getColor() はUIで手動変更した色を返さないための回避策。
- * 取得できない場合は null を返す（呼び出し側で CalendarApp 由来の色にフォールバックする）。
+ * Calendar Advanced Service (REST API) でイベントの colorId と eventLabelId をまとめて取得する。
+ * CalendarApp.getColor() はUIで手動変更した色/ラベルを返さないための回避策。
+ * 取得できなかった項目は null を返す（呼び出し側でフォールバックする）。
  */
-function _getEventColorIdViaAdvancedService(calendarId, eventId) {
+function _getEventColorAndLabelViaAdvancedService(calendarId, eventId) {
   try {
     // CalendarApp由来のIDは "xxxx@google.com" 形式だが、
     // Advanced Service (REST API) は "@" 以降を除いた素のIDを要求するため変換する
     const rawEventId = eventId.split("@")[0];
-    const advEvent = Calendar.Events.get(calendarId, rawEventId, { fields: "colorId" });
-    return advEvent.colorId || null;
+    const advEvent = Calendar.Events.get(calendarId, rawEventId, { fields: "colorId,eventLabelId" });
+    return { colorId: advEvent.colorId || null, eventLabelId: advEvent.eventLabelId || null };
   } catch(e) {
-    Logger.log("Advanced Serviceでの色取得失敗: " + eventId + " " + e.message);
-    return null;
+    Logger.log("Advanced Serviceでの色/ラベル取得失敗: " + eventId + " " + e.message);
+    return { colorId: null, eventLabelId: null };
   }
 }
 
 /**
- * 【調査用・一時関数】Issue #32: eventLabelId移行の可否を実機検証するための診断関数。
- * 指定イベントを colorId/eventLabelId 付きで取得し、eventLabelVersion パラメータの有無による差もログに出す。
- * Calendar UIで手動色変更した直後に実行し、実行ログ（表示 > 実行数 / ログ）を確認する。
- * 判断がついたら削除するか恒久実装に置き換える（Issue #32参照）。
+ * 指定カレンダーの labelProperties.eventLabels を取得し、labelId → labelName の Map を返す。
+ * cache（calendarId → Map）で同一実行内の再取得を避ける。取得失敗時は空のMapを返す。
  */
-function debugEventColorAndLabel(calendarId, eventId) {
-  const rawEventId = eventId.split("@")[0];
-
+function _getLabelNameMap(calendarId, cache) {
+  if (cache.has(calendarId)) return cache.get(calendarId);
+  const map = new Map();
   try {
-    const ev = Calendar.Events.get(calendarId, rawEventId, { fields: "id,summary,colorId,eventLabelId" });
-    Logger.log("[通常] " + JSON.stringify(ev));
+    const cal    = Calendar.Calendars.get(calendarId, { fields: "labelProperties" });
+    const labels = (cal.labelProperties && cal.labelProperties.eventLabels) || [];
+    labels.forEach(function(label) { map.set(label.id, label.name); });
   } catch(e) {
-    Logger.log("[通常] 取得エラー: " + e.message);
+    Logger.log("ラベル情報取得失敗: " + calendarId + " " + e.message);
   }
-
-  try {
-    const ev = Calendar.Events.get(calendarId, rawEventId, { fields: "id,summary,colorId,eventLabelId", eventLabelVersion: 1 });
-    Logger.log("[eventLabelVersion=1] " + JSON.stringify(ev));
-  } catch(e) {
-    Logger.log("[eventLabelVersion=1] 取得エラー: " + e.message);
-  }
-
-  try {
-    const cal = Calendar.Calendars.get(calendarId, { fields: "labelProperties" });
-    Logger.log("[labelProperties] " + JSON.stringify(cal.labelProperties));
-  } catch(e) {
-    Logger.log("[labelProperties] 取得エラー: " + e.message);
-  }
+  cache.set(calendarId, map);
+  return map;
 }
 
 /**
