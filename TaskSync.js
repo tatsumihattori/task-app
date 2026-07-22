@@ -816,6 +816,23 @@ function debugCheckWriteSideColor_run() {
 }
 
 /**
+ * 【調査用・一時関数】Issue #35: 検証用イベントに eventLabelId を直接書き込み、
+ * Calendar UI上で色（ラベル）が表示されるようになるか確認する。
+ * ラベルIDは「タスク苔縄」カレンダーの「未着手」ラベル（Issue #32の調査で判明済み）を使用。
+ */
+function debugSetEventLabel_run() {
+  const calendarId = "c_60e6f80451cdf1045be018eff7cfa2fbe19fac4bc8dec036d29c8701eb9df4fe@group.calendar.google.com";
+  const rawEventId = "oaae70adugeb2rcaqc7ql4bhtc"; // debugCheckWriteSideColor_runと同じテストイベント（@以降を除去済み）
+  const labelId    = "ceaad485-ac0e-459d-9350-beeea49d93d6"; // 苔縄カレンダーの「未着手」ラベル
+  try {
+    const updated = Calendar.Events.patch({ eventLabelId: labelId }, calendarId, rawEventId, { eventLabelVersion: 1 });
+    Logger.log("[ラベル書き込みテスト] " + JSON.stringify(updated));
+  } catch(e) {
+    Logger.log("[ラベル書き込みテスト] エラー: " + e.message);
+  }
+}
+
+/**
  * 指定カレンダーの labelProperties.eventLabels を取得し、labelId → labelName の Map を返す。
  * cache（calendarId → Map）で同一実行内の再取得を避ける。取得失敗時は空のMapを返す。
  */
