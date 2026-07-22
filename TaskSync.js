@@ -39,8 +39,9 @@ const CONFIG = {
     LAST_SYNC:    8,  // H: 最終同期日時（自動管理・編集不要）
     CREATED_BY:   9,  // I: 作成者（自動管理・編集不要）
     UPDATED_BY:  10,  // J: 最終更新者（自動管理・編集不要）
-    PROJECT:     11,  // K: プロジェクト名（表示のみ・GAS未使用）
-    DEADLINE:    12,  // L: 期日（Google Chat期日通知に使用）
+    PROJECT:     11,  // K: プロジェクト名（Calendarイベント説明欄に表示）
+    DEADLINE:    12,  // L: 期日（Google Chat期日通知・Calendarイベント説明欄に使用）
+    CLIENT:      13,  // M: 取引先（Calendarイベント説明欄に表示）
   },
 
   HEADER_ROW: 1,
@@ -271,7 +272,7 @@ function _syncCalendarToSheetsBody() {
     const newStart    = event.isAllDayEvent() ? "" : _formatDateTime(event.getStartTime());
     const newEnd      = event.isAllDayEvent() ? "" : _formatDateTime(event.getEndTime());
     const assignee    = calIdToAssignee.get(sourceCalId) || "";
-    const memo        = _sanitizeForSheet((event.getDescription() || "").trim());
+    const memo        = _sanitizeForSheet(_extractMemoFromDescription(event.getDescription() || "").trim());
     const creator     = event.getCreators()[0] || "Calendar";
     // イベント色がSTATUS_COLORSに対応している場合のみステータスを更新
     // CalendarApp.getColor() はUIで手動変更した色を返さない（空文字になる）ため、
@@ -398,6 +399,9 @@ function _syncRowToCalendar(sheet, row) {
   let   status   = sheet.getRange(row, col.STATUS).getValue();
   const assignee = String(sheet.getRange(row, col.ASSIGNEE).getValue()).trim();
   const memo     = sheet.getRange(row, col.MEMO).getValue();
+  const project  = sheet.getRange(row, col.PROJECT).getValue();
+  const deadline = sheet.getRange(row, col.DEADLINE).getValue();
+  const client   = sheet.getRange(row, col.CLIENT).getValue();
   const eventId  = sheet.getRange(row, col.EVENT_ID).getValue();
 
   const calendarMap = _getAssigneeCalendarMap();
@@ -465,7 +469,7 @@ function _syncRowToCalendar(sheet, row) {
   }
 
   const title       = taskName;
-  const description = memo || "";
+  const description = _buildEventDescription(project, client, deadline, memo);
 
   try {
     const operator  = Session.getActiveUser().getEmail();
@@ -573,7 +577,7 @@ function _notifyUpcomingDeadlinesBody() {
     const assignee    = String(rowData[col.ASSIGNEE - 1]).trim();
     const chatUserId  = chatUserMap.get(assignee);
     const mention     = chatUserId ? "<" + chatUserId + ">" : (assignee || "(担当者未設定)");
-    const deadlineStr = _formatDateTime(deadline).split(" ")[0];
+    const deadlineStr = _formatDateOnly(deadline);
 
     const text = "⏰ " + mention + " タスク「" + taskName + "」の期日が近づいています（期日: " + deadlineStr + "）";
 
@@ -771,4 +775,43 @@ function _formatDateTime(date) {
 function _sanitizeForSheet(value) {
   if (typeof value !== "string") return value;
   return /^[=+\-@]/.test(value) ? "'" + value : value;
+}
+
+// Calendarイベント説明欄で「プロジェクト/取引先/期日」ブロックとメモ本文を区切る文字列
+const _DESCRIPTION_MEMO_DELIMITER = "\n---\n";
+
+/**
+ * Sheetsのセル値（Dateオブジェクト or 文字列）を "YYYY/MM/DD" 形式の日付のみの文字列に変換する。
+ * パースできない場合は元の値をそのまま文字列化して返す（情報を消さない）。
+ */
+function _formatDateOnly(val) {
+  if (!val) return "";
+  const d = (val instanceof Date) ? val : new Date(String(val));
+  if (isNaN(d.getTime())) return String(val);
+  return _formatDateTime(d).split(" ")[0];
+}
+
+/**
+ * プロジェクト名・取引先・期日・メモからCalendarイベントの説明欄テキストを組み立てる。
+ * プロジェクト/取引先/期日がすべて空なら、メモのみ（従来と同じ形式）を返す。
+ */
+function _buildEventDescription(project, client, deadline, memo) {
+  const lines = [];
+  if (project) lines.push("プロジェクト: " + project);
+  if (client)  lines.push("取引先: " + client);
+  const deadlineStr = _formatDateOnly(deadline);
+  if (deadlineStr) lines.push("期日: " + deadlineStr);
+
+  if (lines.length === 0) return memo || "";
+  return lines.join("\n") + _DESCRIPTION_MEMO_DELIMITER + (memo || "");
+}
+
+/**
+ * Calendarイベントの説明欄からメモ本文だけを取り出す（`_buildEventDescription` の逆変換）。
+ * 区切り文字が見つからない場合は説明欄全体をメモとして扱う（従来の挙動と同じフォールバック）。
+ */
+function _extractMemoFromDescription(description) {
+  const idx = description.indexOf(_DESCRIPTION_MEMO_DELIMITER);
+  if (idx === -1) return description;
+  return description.slice(idx + _DESCRIPTION_MEMO_DELIMITER.length);
 }
