@@ -794,6 +794,17 @@ function _getEventColorAndLabelViaAdvancedService(calendarId, eventId) {
 }
 
 /**
+ * 【調査用・一時関数】Issue #35: Sheets起点で作成した直後のイベントに colorId/eventLabelId が
+ * 実際にどう設定されているかを確認する診断関数。Calendar UIを一切操作せず、
+ * Sheetsからタスクを新規登録した直後の Event ID に対して実行する。
+ * 判断がついたら削除する。
+ */
+function debugCheckWriteSideColor(calendarId, eventId) {
+  const result = _getEventColorAndLabelViaAdvancedService(calendarId, eventId);
+  Logger.log("[書き込み直後確認] " + JSON.stringify(result));
+}
+
+/**
  * 指定カレンダーの labelProperties.eventLabels を取得し、labelId → labelName の Map を返す。
  * cache（calendarId → Map）で同一実行内の再取得を避ける。取得失敗時は空のMapを返す。
  */
