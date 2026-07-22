@@ -274,7 +274,12 @@ function _syncCalendarToSheetsBody() {
     const memo        = _sanitizeForSheet((event.getDescription() || "").trim());
     const creator     = event.getCreators()[0] || "Calendar";
     // イベント色がSTATUS_COLORSに対応している場合のみステータスを更新
-    const eventColor = String(event.getColor());
+    // CalendarApp.getColor() はUIで手動変更した色を返さない（空文字になる）ため、
+    // その場合のみ Calendar Advanced Service で実際の colorId を取得する（1件ずつAPI呼び出しになるため、必要な場合のみ実行）
+    let eventColor = String(event.getColor());
+    if (!colorToStatus.has(eventColor)) {
+      eventColor = _getEventColorIdViaAdvancedService(sourceCalId, eventId) || eventColor;
+    }
     Logger.log("色確認: [" + event.getTitle() + "] color=" + eventColor + " → " + (colorToStatus.get(eventColor) || "(未対応)"));
     const newStatus   = colorToStatus.get(eventColor) || null;
 
@@ -710,6 +715,21 @@ function _getAssigneeChatUserMap() {
     if (name && chatUserId) map.set(name, chatUserId);
   });
   return map;
+}
+
+/**
+ * Calendar Advanced Service (REST API) でイベントの colorId を取得する。
+ * CalendarApp.getColor() はUIで手動変更した色を返さないための回避策。
+ * 取得できない場合は null を返す（呼び出し側で CalendarApp 由来の色にフォールバックする）。
+ */
+function _getEventColorIdViaAdvancedService(calendarId, eventId) {
+  try {
+    const advEvent = Calendar.Events.get(calendarId, eventId, { fields: "colorId" });
+    return advEvent.colorId || null;
+  } catch(e) {
+    Logger.log("Advanced Serviceでの色取得失敗: " + eventId + " " + e.message);
+    return null;
+  }
 }
 
 /**

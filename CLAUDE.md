@@ -67,8 +67,8 @@ C列は `_getAssigneeChatUserMap()` で読み込み、Google Chat期日通知で
 
 **Sheets → Calendar**（`_syncRowToCalendar`）: `CONFIG.STATUS_COLORS[status]` で色を決定し `event.setColor()` で設定。正常動作。
 
-**Calendar → Sheets**（`_syncCalendarToSheetsBody`）: `colorToStatus` 逆引きマップを使い `event.getColor()` で色を読む。ただし **GASの `CalendarApp.getColor()` はUIで手動変更した色を返さない**（空文字を返す）ため、カレンダー側での手動色変更はステータスに反映されない。
-→ 回避策として Calendar Advanced Service (REST API) の `Calendar.Events.list()` を使う方法が検討中（未実装）。
+**Calendar → Sheets**（`_syncCalendarToSheetsBody`）: `colorToStatus` 逆引きマップを使い、まず `event.getColor()`（CalendarApp）で色を読む。**GASの `CalendarApp.getColor()` はUIで手動変更した色を返さない**（空文字を返す）ため、その値が `STATUS_COLORS` のいずれにも一致しない場合のみ、`_getEventColorIdViaAdvancedService()` で Calendar Advanced Service (REST API, `Calendar.Events.get()` の `colorId`) を呼び、実際の色を取得する。取得できた `colorId` は `CONFIG.STATUS_COLORS` の値（"2"/"9"/"8"/"7"）と同じ数値文字列表現のため変換不要。
+Advanced Serviceの呼び出しはイベント単位のAPIコールになるため、CalendarApp側で色が判定できる場合（プログラムでsetColorした直後など）はスキップして呼ばないようにしている。
 
 ## 解決済みの重要な技術的ハマりどころ
 
@@ -84,9 +84,10 @@ C列は `_getAssigneeChatUserMap()` で読み込み、Google Chat期日通知で
 
 正規表現は `\d{1,2}` で1・2桁両方に対応済み（Sheetsのセル書式次第で時刻が `9:30` のように1桁になるため）。
 
-### 2. `CalendarEvent.getColor()` の制約
+### 2. `CalendarEvent.getColor()` の制約（Advanced Serviceで対応済み）
 
-GASの CalendarApp 経由では、UIで手動変更したイベント色を `getColor()` で取得できない（空文字を返す）。GASがプログラムで `setColor()` した色のみ取得可能。詳細は「ステータスとカレンダーイベント色の対応」セクション参照。
+GASの CalendarApp 経由では、UIで手動変更したイベント色を `getColor()` で取得できない（空文字を返す）。GASがプログラムで `setColor()` した色のみ取得可能。
+→ `_getEventColorIdViaAdvancedService()` で Calendar Advanced Service の `Calendar.Events.get()` を呼び、実際の `colorId` を取得することで解決済み。`appsscript.json` の `dependencies.enabledAdvancedServices` にCalendar API (v3) を追加してある。詳細は「ステータスとカレンダーイベント色の対応」セクション参照。
 
 ### 3. 担当者変更時のカレンダーイベント移動
 
@@ -99,9 +100,8 @@ GASの CalendarApp 経由では、UIで手動変更したイベント色を `get
 ## 既知の未対応課題
 
 1. **Sheets側で行ごと削除した場合、Calendar側に反映されない**（重要度：中）— タスク名セルを空にする「中身だけ消す削除」は対応済み（担当者の状態に関わらず動作する）。行削除自体は `onChange` トリガーが必要だが実装コストが高いため**運用ルールで対応**（行削除禁止・中身消しで代替）
-2. **Calendar起点のステータス変更（色変更）がSheetsに反映されない**（重要度：中）— Calendar Advanced Service を使えば解決可能、未実装
 
-過去にあった以下の課題は対応済み: 期日の通知機能（Google Chat連携で対応）、新規行の初期値補完（ステータス未入力→未着手、開始日時未入力→終日タスク）。
+過去にあった以下の課題は対応済み: Calendar起点のステータス変更（色変更）のSheets反映（Calendar Advanced Serviceで対応）、期日の通知機能（Google Chat連携で対応）、新規行の初期値補完（ステータス未入力→未着手、開始日時未入力→終日タスク）。
 
 ## 運用上の合意事項
 
@@ -117,6 +117,7 @@ GASの CalendarApp 経由では、UIで手動変更したイベント色を `get
 - clasp で管理。`clasp push` でGASにデプロイ。認証切れ時は `clasp login` で再認証。
 - 対象スプレッドシートのID: `1IJm9RBFAJ_bxpLsxiWEL1yiOHMPH20dwDLdrp_Kz0aPUhnNHMzObMon9`
 - `.clasp.json` の `scriptId` はスプレッドシートの「拡張機能 > Apps Script」から開いたエディタのURLから取得。
+- `appsscript.json` で Calendar Advanced Service (v3) を有効化済み。`clasp push` 後の初回実行時に、通常より広い権限（Calendar API）の再承認ダイアログが出ることがある。エラーが出る場合はAppsScriptエディタの「サービス」一覧にCalendar APIが表示されているか確認すること。
 
 ## Session.getActiveUser() の既知の制約
 
