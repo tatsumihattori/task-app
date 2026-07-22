@@ -25,6 +25,8 @@ const CONFIG = {
   SYNC_DAYS_AHEAD: 90,           // Calendarからの取得範囲（今日から何日先まで）
   SYNC_DAYS_BACK: 7,             // Calendarからの取得範囲（今日から何日前まで）
 
+  CHAT_NOTIFY_DAYS_BEFORE: 3,    // 期日の何日前から通知を開始するか（当日を含めて毎日通知）
+
   // 列番号（1始まり）
   COL: {
     TASK_NAME:    1,  // A: タスク名
@@ -38,7 +40,7 @@ const CONFIG = {
     CREATED_BY:   9,  // I: 作成者（自動管理・編集不要）
     UPDATED_BY:  10,  // J: 最終更新者（自動管理・編集不要）
     PROJECT:     11,  // K: プロジェクト名（表示のみ・GAS未使用）
-    DEADLINE:    12,  // L: 期日
+    DEADLINE:    12,  // L: 期日（Google Chat期日通知に使用）
   },
 
   HEADER_ROW: 1,
@@ -57,7 +59,9 @@ function setup() {
   SpreadsheetApp.getUi().alert(
     "✅ セットアップ完了！\n\n" +
     "・Sheetsを編集すると自動でCalendarに反映されます\n" +
-    "・CalendarからSheetsへの同期は10分ごとに実行されます"
+    "・CalendarからSheetsへの同期は10分ごとに実行されます\n" +
+    "・期日が近いタスクのGoogle Chat通知は毎日9時に実行されます\n" +
+    "　（スクリプトプロパティ CHAT_WEBHOOK_URL が未設定の場合は通知されません）"
   );
 }
 
@@ -181,6 +185,18 @@ function syncCalendarToSheets() {
     _notifyError("syncCalendarToSheets", e);
   } finally {
     lock.releaseLock();
+  }
+}
+
+/**
+ * 定期実行：期日が近いタスクをGoogle Chatに通知（担当者をメンション）
+ * Webhook URLはスクリプトプロパティ "CHAT_WEBHOOK_URL" から読み込む（コードには書かない）
+ */
+function notifyUpcomingDeadlines() {
+  try {
+    _notifyUpcomingDeadlinesBody();
+  } catch(e) {
+    _notifyError("notifyUpcomingDeadlines", e);
   }
 }
 
@@ -512,6 +528,63 @@ function _notifyError(context, err) {
 }
 
 /**
+ * 期日が近いタスクをGoogle Chatに通知する（担当者をメンション）
+ * Webhook URLはスクリプトプロパティ "CHAT_WEBHOOK_URL" から取得する（ソースコードには書かない）
+ */
+function _notifyUpcomingDeadlinesBody() {
+  const webhookUrl = PropertiesService.getScriptProperties().getProperty("CHAT_WEBHOOK_URL");
+  if (!webhookUrl) {
+    Logger.log("CHAT_WEBHOOK_URL未設定のため期日通知をスキップ");
+    return;
+  }
+
+  const sheet   = _getOrCreateSheet();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < CONFIG.DATA_START_ROW) return;
+
+  const col      = CONFIG.COL;
+  const NUM_COLS = Object.keys(col).length;
+  const rows     = sheet.getRange(CONFIG.DATA_START_ROW, 1, lastRow - CONFIG.HEADER_ROW, NUM_COLS).getValues();
+
+  const chatUserMap = _getAssigneeChatUserMap();
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const limit = new Date(today.getTime() + CONFIG.CHAT_NOTIFY_DAYS_BEFORE * 24 * 60 * 60 * 1000);
+
+  rows.forEach(function(rowData) {
+    const status = String(rowData[col.STATUS - 1]);
+    if (status === "完了" || status === "キャンセル") return;
+
+    const deadlineVal = rowData[col.DEADLINE - 1];
+    if (!deadlineVal) return;
+    const deadline = (deadlineVal instanceof Date) ? new Date(deadlineVal) : new Date(String(deadlineVal));
+    if (isNaN(deadline.getTime())) return;
+    deadline.setHours(0, 0, 0, 0);
+
+    if (deadline < today || deadline > limit) return;
+
+    const taskName    = rowData[col.TASK_NAME - 1];
+    const assignee    = String(rowData[col.ASSIGNEE - 1]).trim();
+    const chatUserId  = chatUserMap.get(assignee);
+    const mention     = chatUserId ? "<" + chatUserId + ">" : (assignee || "(担当者未設定)");
+    const deadlineStr = _formatDateTime(deadline).split(" ")[0];
+
+    const text = "⏰ " + mention + " タスク「" + taskName + "」の期日が近づいています（期日: " + deadlineStr + "）";
+
+    try {
+      UrlFetchApp.fetch(webhookUrl, {
+        method: "post",
+        contentType: "application/json",
+        payload: JSON.stringify({ text: text }),
+      });
+    } catch(e) {
+      Logger.log("Chat通知送信失敗: " + taskName + " " + e.message);
+    }
+  });
+}
+
+/**
  * ヘッダー行を作成
  */
 function _createHeader() {
@@ -551,7 +624,7 @@ function _createHeader() {
 function _registerTriggers() {
   const triggers = ScriptApp.getProjectTriggers();
   triggers.forEach(function(t) {
-    if (["onEditTrigger", "syncCalendarToSheets"].includes(t.getHandlerFunction())) {
+    if (["onEditTrigger", "syncCalendarToSheets", "notifyUpcomingDeadlines"].includes(t.getHandlerFunction())) {
       ScriptApp.deleteTrigger(t);
     }
   });
@@ -564,6 +637,12 @@ function _registerTriggers() {
   ScriptApp.newTrigger("syncCalendarToSheets")
     .timeBased()
     .everyMinutes(10)
+    .create();
+
+  ScriptApp.newTrigger("notifyUpcomingDeadlines")
+    .timeBased()
+    .everyDays(1)
+    .atHour(9)
     .create();
 }
 
@@ -610,6 +689,25 @@ function _getAssigneeCalendarMap() {
     const name  = String(row[0]).trim();
     const calId = String(row[1]).trim();
     if (name && calId) map.set(name, calId);
+  });
+  return map;
+}
+
+/**
+ * 担当者マスタシート（GID: 881583119）のC列を読み込み、担当者名 → ChatユーザーID（"users/xxxx"形式）の Map を返す
+ * C列が未入力の担当者はMapに含まれない（呼び出し側で担当者名へのフォールバックが必要）
+ */
+function _getAssigneeChatUserMap() {
+  const sheet = SpreadsheetApp.getActive().getSheets()
+    .find(function(s) { return s.getSheetId() === 881583119; });
+  if (!sheet || sheet.getLastRow() < 2) return new Map();
+
+  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
+  const map  = new Map();
+  data.forEach(function(row) {
+    const name       = String(row[0]).trim();
+    const chatUserId = String(row[2] || "").trim();
+    if (name && chatUserId) map.set(name, chatUserId);
   });
   return map;
 }
