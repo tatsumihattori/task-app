@@ -56,7 +56,7 @@ A列=担当者名、B列=カレンダーID、C列=ChatユーザーID（`users/xx
 `_getAssigneeCalendarMap()` でA・B列をMapに読み込む。マスタ未登録の担当者はSheets→Calendar同期をスキップ（削除は担当者の状態に関わらず行われる。詳細は「運用上の合意事項」参照）。
 カレンダーID→担当者名の逆引きマップも同関数内で生成（`calIdToAssignee`）し、Calendar→Sheets同期での担当者列埋めに使用。
 C列は `_getAssigneeChatUserMap()` で読み込み、Google Chat期日通知でのメンションに使用（未入力の担当者は名前をテキストで含めるだけでメンションは飛ばない）。
-新規担当者のカレンダーには、"未着手"/"進行中"/"完了"/"キャンセル" の4つのラベルをCalendar UIで作成しておくこと（Calendar側での手動ステータス変更を検知するために使う。詳細は「解決済みの重要な技術的ハマりどころ」項目6参照）。未作成でも同期自体は壊れず、`colorId`ベースの判定にフォールバックする。
+新規担当者のカレンダーには、"未着手"/"進行中"/"完了"/"キャンセル" の4つのラベルをCalendar UIで作成しておくこと。Calendar側での手動ステータス変更の検知（詳細は「解決済みの重要な技術的ハマりどころ」項目6参照）だけでなく、Sheets→Calendar同期時の色表示（項目7参照）にも必要。未作成でも同期自体は壊れず、Calendar→Sheetsは`colorId`ベースの判定に、Sheets→Calendarは`setColor()`のみにフォールバックする。
 
 ## Google Chat連携（期日通知）
 
@@ -85,7 +85,7 @@ Calendar→Sheets同期（`_syncCalendarToSheetsBody`）は `_extractMemoFromDes
 
 ## ステータスとカレンダーイベント色の対応
 
-**Sheets → Calendar**（`_syncRowToCalendar`）: `CONFIG.STATUS_COLORS[status]` で色を決定し `event.setColor()` で設定。正常動作。
+**Sheets → Calendar**（`_syncRowToCalendar`）: `CONFIG.STATUS_COLORS[status]` で色を決定し `event.setColor()` で設定する。ただしラベル機能（`labelProperties`）が設定されているカレンダーでは `setColor()` だけでは色が反映されない（`colorId`・`eventLabelId` とも設定されず、Calendar UI上も無色のまま。Issue #35）。そのため `setColor()` に加えて、`_getCalendarLabelMaps()` でステータス名（`status`）と文字列完全一致するラベルIDを引き、見つかれば `_setEventLabel()` で `Calendar.Events.patch()` により `eventLabelId` を直接書き込む（Advanced Service）。ラベルが無い/名前が一致しないカレンダーは従来通り `setColor()` の結果のみに依存する（フォールバック、退行なし）。ラベル書き込み失敗はログに残すのみでタスク作成/更新自体は継続する（詳細は「解決済みの重要な技術的ハマりどころ」項目7参照）。
 
 **Calendar → Sheets**（`_syncCalendarToSheetsBody`）: 3段階でステータスを判定する。
 
@@ -155,6 +155,16 @@ GASの CalendarApp 経由では、UIで手動変更したイベント色を `get
 **解決策**: このカレンダーの`labelProperties.eventLabels`には、`CONFIG.STATUS_COLORS`のキーと文字列完全一致する名前（"未着手"/"進行中"/"完了"/"キャンセル"）のラベルが担当者マスタの全カレンダーに既に用意されていたため、`eventLabelId` → ラベル名 → ステータス、という解決をラベル名の完全一致でそのまま行える（hexマッチング等は不要）。`_getEventColorAndLabelViaAdvancedService()`で`colorId`と`eventLabelId`をまとめて取得し、`eventLabelId`が解決できればそちらを優先、できなければ`colorId`にフォールバックする2段構えにした。書き込み側（`_syncRowToCalendar`の`setColor()`）は変更していない。
 
 → **新しく担当者を追加する場合、そのカレンダーにも同じ4つのラベル（未着手/進行中/完了/キャンセル）をCalendar UIで作成しておくこと。ラベルが無いカレンダーは自動的に`colorId`判定にフォールバックする（動作はするがCalendar手動変更の検知精度が落ちる）。**
+
+### 7. Calendar新UIの「ラベル」機能により、書き込み側の`CalendarApp.setColor()`が無効化されていた（Issue #35で対応済み）
+
+**症状**: Sheetsからタスクを新規作成/更新しても、Calendar側でイベントに色が一切つかない（デフォルト色のまま）。`_syncRowToCalendar`の`setColor()`自体は例外を投げず、Event IDも正常に払い出される。
+
+**原因**: 項目6（読み取り側）の裏返し。`labelProperties`（ラベル機能）が設定されているカレンダーでは、`CalendarApp.setColor()`で書き込んだ色がCalendar側に一切反映されない。実機検証では、`setColor()`実行直後にAdvanced Service経由でイベントを取得しても`colorId`・`eventLabelId`とも`null`で、Calendar UI上も無色のままだった。同じイベントに対してAdvanced Serviceで`Calendar.Events.patch({eventLabelId: <ラベルのUUID>}, ..., {eventLabelVersion: 1})`を直接呼ぶと、API応答に`eventLabelId`が反映され、Calendar UI上でも実際に色が表示されることを目視確認済み。
+
+**解決策**: `_syncRowToCalendar`で`setColor()`を呼んだ後、対象カレンダーの`labelProperties.eventLabels`（`_getCalendarLabelMaps()`で取得、`name→id`方向）からステータス名と完全一致するラベルを探し、見つかれば`_setEventLabel()`で`eventLabelId`を直接書き込む。ラベルが無い/名前が一致しないカレンダーは`setColor()`の結果のみに依存する（従来通り、退行なし）。`setColor()`自体は削除していない（ラベル無しカレンダーでは引き続き唯一の色付け手段のため）。
+
+→ **新しく担当者を追加する場合、そのカレンダーに4つのラベル（未着手/進行中/完了/キャンセル）を作成しておくことが、読み取り側（項目6）だけでなく書き込み側の色表示にも必要。**
 
 ## 既知の未対応課題
 
