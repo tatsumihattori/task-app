@@ -344,15 +344,17 @@ function _syncCalendarToSheetsBody() {
   Logger.log("Calendar -> Sheets 同期完了: " + addedCount + "件追加 / " + updatedCount + "件更新");
 
   // カレンダーから削除されたイベントをSheetsからも削除
-  _removeDeletedEvents(sheet, events, eventIdToRow);
+  _removeDeletedEvents(sheet, events, eventIdToRow, uniqueCalIds);
 }
 
 /**
  * カレンダー上に存在しなくなったイベントのSheets行を削除する
- * ※ 同期取得範囲（SYNC_DAYS_BACK〜SYNC_DAYS_AHEAD）外の行は判定対象外
- *   （範囲外はそもそもカレンダーから取得していないため、削除判断ができない）
+ * ※ 同期取得範囲（SYNC_DAYS_BACK〜SYNC_DAYS_AHEAD）外の行は、日付だけでは「カレンダーから消えた」のか
+ *   「範囲外なだけ」なのか判断できない。開始日時（B列）が読める行はそのレンジ判定でスキップする。
+ *   終日タスク（B列が仕様上つねに空欄）やフォーマット不正の行はレンジ判定ができないため、
+ *   代わりに calendarIds 全件を対象に getEventById による実在確認（日付に縛られない）にフォールバックする。
  */
-function _removeDeletedEvents(sheet, calendarEvents, eventIdToRow) {
+function _removeDeletedEvents(sheet, calendarEvents, eventIdToRow, calendarIds) {
   if (eventIdToRow.size === 0) return;
 
   const now       = new Date();
@@ -365,10 +367,18 @@ function _removeDeletedEvents(sheet, calendarEvents, eventIdToRow) {
   eventIdToRow.forEach(function(row, eventId) {
     if (activeIds.has(eventId)) return;
 
-    // 同期範囲外の行は「カレンダーから消えた」か判断できないのでスキップ
     const startVal  = sheet.getRange(row, CONFIG.COL.START).getDisplayValue();
     const startDate = _sheetDateToCalendarDate(startVal);
-    if (!startDate || startDate < syncStart || startDate > syncEnd) return;
+
+    if (!startDate) {
+      // 終日タスク／フォーマット不正行：日付で範囲内外を判断できないので直接検索で実在確認する
+      if (_findEventInCalendars(eventId, calendarIds)) return; // 取得範囲外にまだ存在する → 削除しない
+      rowsToDelete.push(row);
+      return;
+    }
+
+    // 同期範囲外の行は「カレンダーから消えた」か判断できないのでスキップ
+    if (startDate < syncStart || startDate > syncEnd) return;
 
     rowsToDelete.push(row);
   });
