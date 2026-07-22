@@ -251,8 +251,9 @@ function _syncCalendarToSheetsBody() {
     const sourceCalId = entry.sourceCalId;
     const eventId     = event.getId();
     const newTaskName = _sanitizeForSheet(event.getTitle());
-    const newStart    = _formatDateTime(event.getStartTime());
-    const newEnd      = _formatDateTime(event.getEndTime());
+    // 終日イベントは開始日時を空欄のまま保つ（Sheets→Calendar側の「開始日時が空＝終日タスク」という表現を維持する）
+    const newStart    = event.isAllDayEvent() ? "" : _formatDateTime(event.getStartTime());
+    const newEnd      = event.isAllDayEvent() ? "" : _formatDateTime(event.getEndTime());
     const assignee    = calIdToAssignee.get(sourceCalId) || "";
     const memo        = _sanitizeForSheet((event.getDescription() || "").trim());
     const creator     = event.getCreators()[0] || "Calendar";
@@ -373,13 +374,26 @@ function _syncRowToCalendar(sheet, row) {
   const taskName = sheet.getRange(row, col.TASK_NAME).getValue();
   const startVal = sheet.getRange(row, col.START).getDisplayValue();
   const endVal   = sheet.getRange(row, col.END).getDisplayValue();
-  const status   = sheet.getRange(row, col.STATUS).getValue();
+  let   status   = sheet.getRange(row, col.STATUS).getValue();
   const assignee = String(sheet.getRange(row, col.ASSIGNEE).getValue()).trim();
   const memo     = sheet.getRange(row, col.MEMO).getValue();
   const eventId  = sheet.getRange(row, col.EVENT_ID).getValue();
 
-  // 担当者マスタから対象カレンダーを決定（未登録はスキップ）
   const calendarMap = _getAssigneeCalendarMap();
+
+  // タスク名が空なら削除扱い（担当者の状態に関わらず、全カレンダーから検索して削除）
+  if (!taskName) {
+    if (eventId) {
+      try {
+        const found = _findEventInCalendars(eventId, [...calendarMap.values()]);
+        if (found) found.event.deleteEvent();
+      } catch(e) {}
+      sheet.getRange(row, col.EVENT_ID).clearContent();
+    }
+    return;
+  }
+
+  // 担当者マスタから対象カレンダーを決定（未登録はスキップ。削除はしない）
   if (!assignee || !calendarMap.has(assignee)) {
     Logger.log("スキップ: row=" + row + " 担当者「" + assignee + "」はマスタに未登録");
     return;
@@ -391,46 +405,42 @@ function _syncRowToCalendar(sheet, row) {
     return;
   }
 
-  // タスク名または開始日時が空なら削除扱い
-  if (!taskName || !startVal) {
-    if (eventId) {
-      try {
-        const ev = targetCal.getEventById(eventId);
-        if (ev) {
-          ev.deleteEvent();
-        } else {
-          // 担当者変更後かもしれないので全カレンダーから検索
-          const found = _findEventInCalendars(eventId, [...calendarMap.values()]);
-          if (found) found.event.deleteEvent();
-        }
-      } catch(e) {}
-      sheet.getRange(row, col.EVENT_ID).clearContent();
+  if (!status) {
+    status = "未着手";
+    sheet.getRange(row, col.STATUS).setValue(status);
+  }
+
+  // 開始日時が空なら終日タスクとして登録する（日付はトリガー発火日）
+  const isAllDay = !startVal;
+  let startDate;
+  let endDate = null;
+
+  if (isAllDay) {
+    startDate = new Date();
+  } else {
+    // getDisplayValue() の文字列をそのままパースするため TZ 変換は発生しない
+    startDate = _sheetDateToCalendarDate(startVal);
+    if (!startDate) {
+      sheet.getRange(row, col.LAST_SYNC).setValue("⚠ 日時フォーマット不正");
+      Logger.log("バリデーションエラー: row=" + row + " 開始日時のフォーマットが不正");
+      return;
     }
-    return;
-  }
 
-  // getDisplayValue() の文字列をそのままパースするため TZ 変換は発生しない
-  const startDate = _sheetDateToCalendarDate(startVal);
-  if (!startDate) {
-    sheet.getRange(row, col.LAST_SYNC).setValue("⚠ 日時フォーマット不正");
-    Logger.log("バリデーションエラー: row=" + row + " 開始日時のフォーマットが不正");
-    return;
-  }
+    endDate = endVal
+      ? _sheetDateToCalendarDate(endVal)
+      : new Date(startDate.getTime() + 60 * 60 * 1000);
 
-  const endDate = endVal
-    ? _sheetDateToCalendarDate(endVal)
-    : new Date(startDate.getTime() + 60 * 60 * 1000);
+    if (endVal && !endDate) {
+      sheet.getRange(row, col.LAST_SYNC).setValue("⚠ 日時フォーマット不正");
+      Logger.log("バリデーションエラー: row=" + row + " 終了日時のフォーマットが不正");
+      return;
+    }
 
-  if (endVal && !endDate) {
-    sheet.getRange(row, col.LAST_SYNC).setValue("⚠ 日時フォーマット不正");
-    Logger.log("バリデーションエラー: row=" + row + " 終了日時のフォーマットが不正");
-    return;
-  }
-
-  if (endDate && endDate <= startDate) {
-    sheet.getRange(row, col.LAST_SYNC).setValue("⚠ 終了 < 開始");
-    Logger.log("バリデーションエラー: row=" + row + " 終了日時が開始日時より前");
-    return;
+    if (endDate && endDate <= startDate) {
+      sheet.getRange(row, col.LAST_SYNC).setValue("⚠ 終了 < 開始");
+      Logger.log("バリデーションエラー: row=" + row + " 終了日時が開始日時より前");
+      return;
+    }
   }
 
   const title       = taskName;
@@ -448,7 +458,11 @@ function _syncRowToCalendar(sheet, row) {
       if (ev) {
         // 同じカレンダー → 更新
         ev.setTitle(title);
-        ev.setTime(startDate, endDate);
+        if (isAllDay) {
+          ev.setAllDayDate(startDate);
+        } else {
+          ev.setTime(startDate, endDate);
+        }
         ev.setDescription(description);
         const color = CONFIG.STATUS_COLORS[status];
         if (color) ev.setColor(color);
@@ -467,9 +481,9 @@ function _syncRowToCalendar(sheet, row) {
     }
 
     // 新規作成
-    const newEvent = targetCal.createEvent(title, startDate, endDate, {
-      description: description,
-    });
+    const newEvent = isAllDay
+      ? targetCal.createAllDayEvent(title, startDate, { description: description })
+      : targetCal.createEvent(title, startDate, endDate, { description: description });
     const color = CONFIG.STATUS_COLORS[status];
     if (color) newEvent.setColor(color);
     sheet.getRange(row, col.EVENT_ID).setValue(newEvent.getId());
