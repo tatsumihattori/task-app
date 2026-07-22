@@ -396,7 +396,7 @@ function _syncRowToCalendar(sheet, row) {
   const taskName = sheet.getRange(row, col.TASK_NAME).getValue();
   const startVal = sheet.getRange(row, col.START).getDisplayValue();
   const endVal   = sheet.getRange(row, col.END).getDisplayValue();
-  let   status   = sheet.getRange(row, col.STATUS).getValue();
+  let   status   = String(sheet.getRange(row, col.STATUS).getValue()).trim();
   const assignee = String(sheet.getRange(row, col.ASSIGNEE).getValue()).trim();
   const memo     = sheet.getRange(row, col.MEMO).getValue();
   const project  = sheet.getRange(row, col.PROJECT).getValue();
@@ -490,7 +490,11 @@ function _syncRowToCalendar(sheet, row) {
         }
         ev.setDescription(description);
         const color = CONFIG.STATUS_COLORS[status];
-        if (color) ev.setColor(color);
+        if (color) {
+          ev.setColor(color);
+        } else {
+          Logger.log("警告: row=" + row + " 未対応のステータス「" + status + "」のためCalendar色を更新しませんでした");
+        }
         sheet.getRange(row, col.LAST_SYNC).setValue(new Date());
         sheet.getRange(row, col.UPDATED_BY).setValue(operator);
         Logger.log("更新: " + title + " by " + operator);
@@ -510,7 +514,11 @@ function _syncRowToCalendar(sheet, row) {
       ? targetCal.createAllDayEvent(title, startDate, { description: description })
       : targetCal.createEvent(title, startDate, endDate, { description: description });
     const color = CONFIG.STATUS_COLORS[status];
-    if (color) newEvent.setColor(color);
+    if (color) {
+      newEvent.setColor(color);
+    } else {
+      Logger.log("警告: row=" + row + " 未対応のステータス「" + status + "」のためCalendar色を設定しませんでした");
+    }
     sheet.getRange(row, col.EVENT_ID).setValue(newEvent.getId());
     sheet.getRange(row, col.LAST_SYNC).setValue(new Date());
     sheet.getRange(row, col.CREATED_BY).setValue(operator);
@@ -561,6 +569,9 @@ function _notifyUpcomingDeadlinesBody() {
   today.setHours(0, 0, 0, 0);
   const limit = new Date(today.getTime() + CONFIG.CHAT_NOTIFY_DAYS_BEFORE * 24 * 60 * 60 * 1000);
 
+  // 担当者ごとにタスクをまとめてから1人1メッセージで送る
+  const tasksByAssignee = new Map(); // assignee(表示名) -> [{ taskName, deadline, deadlineStr }]
+
   rows.forEach(function(rowData) {
     const status = String(rowData[col.STATUS - 1]);
     if (status === "完了" || status === "キャンセル") return;
@@ -573,13 +584,27 @@ function _notifyUpcomingDeadlinesBody() {
 
     if (deadline < today || deadline > limit) return;
 
-    const taskName    = rowData[col.TASK_NAME - 1];
-    const assignee    = String(rowData[col.ASSIGNEE - 1]).trim();
-    const chatUserId  = chatUserMap.get(assignee);
-    const mention     = chatUserId ? "<" + chatUserId + ">" : (assignee || "(担当者未設定)");
-    const deadlineStr = _formatDateOnly(deadline);
+    const taskName = rowData[col.TASK_NAME - 1];
+    const assignee = String(rowData[col.ASSIGNEE - 1]).trim() || "(担当者未設定)";
 
-    const text = "⏰ " + mention + " タスク「" + taskName + "」の期日が近づいています（期日: " + deadlineStr + "）";
+    if (!tasksByAssignee.has(assignee)) tasksByAssignee.set(assignee, []);
+    tasksByAssignee.get(assignee).push({
+      taskName: taskName,
+      deadline: deadline,
+      deadlineStr: _formatDateOnly(deadline),
+    });
+  });
+
+  tasksByAssignee.forEach(function(tasks, assignee) {
+    tasks.sort(function(a, b) { return a.deadline - b.deadline; });
+
+    const chatUserId = chatUserMap.get(assignee);
+    const mention     = chatUserId ? "<" + chatUserId + ">" : assignee;
+    const taskLines   = tasks.map(function(t) {
+      return "・" + t.taskName + "（期日: " + t.deadlineStr + "）";
+    }).join("\n");
+
+    const text = "⏰ " + mention + " 期日が近づいているタスクがあります\n" + taskLines;
 
     try {
       UrlFetchApp.fetch(webhookUrl, {
@@ -588,7 +613,7 @@ function _notifyUpcomingDeadlinesBody() {
         payload: JSON.stringify({ text: text }),
       });
     } catch(e) {
-      Logger.log("Chat通知送信失敗: " + taskName + " " + e.message);
+      Logger.log("Chat通知送信失敗: " + assignee + " " + e.message);
     }
   });
 }
@@ -728,7 +753,10 @@ function _getAssigneeChatUserMap() {
  */
 function _getEventColorIdViaAdvancedService(calendarId, eventId) {
   try {
-    const advEvent = Calendar.Events.get(calendarId, eventId, { fields: "colorId" });
+    // CalendarApp由来のIDは "xxxx@google.com" 形式だが、
+    // Advanced Service (REST API) は "@" 以降を除いた素のIDを要求するため変換する
+    const rawEventId = eventId.split("@")[0];
+    const advEvent = Calendar.Events.get(calendarId, rawEventId, { fields: "colorId" });
     return advEvent.colorId || null;
   } catch(e) {
     Logger.log("Advanced Serviceでの色取得失敗: " + eventId + " " + e.message);
