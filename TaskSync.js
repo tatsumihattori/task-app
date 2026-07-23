@@ -269,87 +269,115 @@ function _syncCalendarToSheetsBody() {
   let updatedCount = 0;
   const pendingUpdates = []; // { rowNum, values }[]
   const pendingNewRows = []; // values[][]
+  const eventErrors    = []; // { eventId, message }[]（イベント単位の処理失敗を集約し、ループ後にまとめて1回だけ通知する）
 
   events.forEach(function(entry) {
     const event       = entry.event;
     const sourceCalId = entry.sourceCalId;
-    const eventId     = event.getId();
-    const newTaskName = _sanitizeForSheet(event.getTitle());
-    // 終日イベントは開始日時を空欄のまま保つ（Sheets→Calendar側の「開始日時が空＝終日タスク」という表現を維持する）
-    const newStart    = event.isAllDayEvent() ? "" : _formatDateTime(event.getStartTime());
-    const newEnd      = event.isAllDayEvent() ? "" : _formatDateTime(event.getEndTime());
-    const assignee    = calIdToAssignee.get(sourceCalId) || "";
-    const memo        = _sanitizeForSheet(_extractMemoFromDescription(event.getDescription() || "").trim());
-    const creator     = event.getCreators()[0] || "Calendar";
-    // ステータス判定: まずCalendarApp（追加API呼び出し不要）の色で判定を試みる。
-    // 判定できない場合のみ Advanced Service で colorId と eventLabelId をまとめて取得する。
-    // eventLabelId はCalendarの「ラベル」機能に対応し、UIでの手動変更を確実に反映するため colorId より優先する
-    // （実機検証で colorId は手動変更後に欠落・不一致することがあったが eventLabelId は常に反映されていた）。
-    let newStatus  = colorToStatus.get(String(event.getColor())) || null;
-    let resolvedBy = newStatus ? "CalendarApp色" : null;
 
-    if (newStatus === null) {
-      const adv = _getEventColorAndLabelViaAdvancedService(sourceCalId, eventId);
-      if (adv.eventLabelId) {
-        const labelName = _getCalendarLabelMaps(sourceCalId, labelNameCache).idToName.get(adv.eventLabelId);
-        if (labelName && validStatuses.has(labelName)) {
-          newStatus  = labelName;
-          resolvedBy = "ラベル(" + labelName + ")";
+    let eventId;
+    try {
+      eventId = event.getId();
+    } catch (idErr) {
+      Logger.log("イベントID取得失敗のためスキップ: " + idErr.message);
+      eventErrors.push({ eventId: "(不明)", message: idErr.message });
+      return;
+    }
+
+    // 対象イベントが同一実行中にCalendar側で削除・変更されると、CalendarAppのイベントオブジェクトへの
+    // アクセス（getTitle/getStartTime/getColor等）やAdvanced Service呼び出しが例外を投げることがある。
+    // 1件の失敗でforEach全体・ひいては後続の _removeDeletedEvents 呼び出しまで巻き込んで中断させないよう、
+    // イベント単位でtry/catchし、失敗したイベントだけスキップして次へ進む。
+    // 既存行は前回値を維持、新規イベントは次回同期で再試行される（いずれも安全側）。
+    try {
+      const newTaskName = _sanitizeForSheet(event.getTitle());
+      // 終日イベントは開始日時を空欄のまま保つ（Sheets→Calendar側の「開始日時が空＝終日タスク」という表現を維持する）
+      const newStart    = event.isAllDayEvent() ? "" : _formatDateTime(event.getStartTime());
+      const newEnd      = event.isAllDayEvent() ? "" : _formatDateTime(event.getEndTime());
+      const assignee    = calIdToAssignee.get(sourceCalId) || "";
+      const memo        = _sanitizeForSheet(_extractMemoFromDescription(event.getDescription() || "").trim());
+      const creator     = event.getCreators()[0] || "Calendar";
+      // ステータス判定: まずCalendarApp（追加API呼び出し不要）の色で判定を試みる。
+      // 判定できない場合のみ Advanced Service で colorId と eventLabelId をまとめて取得する。
+      // eventLabelId はCalendarの「ラベル」機能に対応し、UIでの手動変更を確実に反映するため colorId より優先する
+      // （実機検証で colorId は手動変更後に欠落・不一致することがあったが eventLabelId は常に反映されていた）。
+      let newStatus  = colorToStatus.get(String(event.getColor())) || null;
+      let resolvedBy = newStatus ? "CalendarApp色" : null;
+
+      if (newStatus === null) {
+        const adv = _getEventColorAndLabelViaAdvancedService(sourceCalId, eventId);
+        if (adv.eventLabelId) {
+          const labelName = _getCalendarLabelMaps(sourceCalId, labelNameCache).idToName.get(adv.eventLabelId);
+          if (labelName && validStatuses.has(labelName)) {
+            newStatus  = labelName;
+            resolvedBy = "ラベル(" + labelName + ")";
+          }
+        }
+        if (newStatus === null && adv.colorId && colorToStatus.has(adv.colorId)) {
+          newStatus  = colorToStatus.get(adv.colorId);
+          resolvedBy = "colorId(" + adv.colorId + ")";
         }
       }
-      if (newStatus === null && adv.colorId && colorToStatus.has(adv.colorId)) {
-        newStatus  = colorToStatus.get(adv.colorId);
-        resolvedBy = "colorId(" + adv.colorId + ")";
+
+      Logger.log("色確認: [" + event.getTitle() + "] " + (resolvedBy ? resolvedBy + " → " + newStatus : "(未対応)"));
+
+      if (eventIdToEntry.has(eventId)) {
+        // ---- 既存行：差分チェック（読み取り済みデータを使用） ----
+        const entry = eventIdToEntry.get(eventId);
+        const d     = entry.data;
+
+        const statusChanged = newStatus !== null && String(d[col.STATUS - 1]) !== newStatus;
+        const changed =
+          statusChanged                                          ||
+          String(d[col.TASK_NAME - 1])          !== newTaskName ||
+          _formatDateTime(d[col.START - 1])      !== newStart    ||
+          _formatDateTime(d[col.END - 1])        !== newEnd      ||
+          String(d[col.ASSIGNEE - 1])            !== assignee    ||
+          String(d[col.MEMO - 1])                !== memo;
+
+        if (changed) {
+          const updated = d.slice(); // 既存値をコピーし変更列だけ上書き
+          updated[col.TASK_NAME - 1]  = newTaskName;
+          if (newStatus !== null) updated[col.STATUS - 1] = newStatus;
+          updated[col.START - 1]      = newStart;
+          updated[col.END - 1]        = newEnd;
+          updated[col.ASSIGNEE - 1]   = assignee;
+          updated[col.MEMO - 1]       = memo;
+          updated[col.LAST_SYNC - 1]  = syncTime;
+          updated[col.UPDATED_BY - 1] = creator;
+          pendingUpdates.push({ rowNum: entry.rowNum, values: updated });
+          Logger.log("更新: row=" + entry.rowNum + " [" + newTaskName + "]" + (statusChanged ? " ステータス→" + newStatus : ""));
+          updatedCount++;
+        }
+      } else {
+        // ---- 新規行 ----
+        const newRow = new Array(NUM_COLS).fill("");
+        newRow[col.TASK_NAME - 1]  = newTaskName;
+        newRow[col.START - 1]      = newStart;
+        newRow[col.END - 1]        = newEnd;
+        newRow[col.STATUS - 1]     = newStatus || "未着手";
+        newRow[col.ASSIGNEE - 1]   = assignee;
+        newRow[col.MEMO - 1]       = memo;
+        newRow[col.EVENT_ID - 1]   = eventId;
+        newRow[col.LAST_SYNC - 1]  = syncTime;
+        newRow[col.CREATED_BY - 1] = creator;
+        newRow[col.UPDATED_BY - 1] = creator;
+        pendingNewRows.push(newRow);
+        addedCount++;
       }
-    }
-
-    Logger.log("色確認: [" + event.getTitle() + "] " + (resolvedBy ? resolvedBy + " → " + newStatus : "(未対応)"));
-
-    if (eventIdToEntry.has(eventId)) {
-      // ---- 既存行：差分チェック（読み取り済みデータを使用） ----
-      const entry = eventIdToEntry.get(eventId);
-      const d     = entry.data;
-
-      const statusChanged = newStatus !== null && String(d[col.STATUS - 1]) !== newStatus;
-      const changed =
-        statusChanged                                          ||
-        String(d[col.TASK_NAME - 1])          !== newTaskName ||
-        _formatDateTime(d[col.START - 1])      !== newStart    ||
-        _formatDateTime(d[col.END - 1])        !== newEnd      ||
-        String(d[col.ASSIGNEE - 1])            !== assignee    ||
-        String(d[col.MEMO - 1])                !== memo;
-
-      if (changed) {
-        const updated = d.slice(); // 既存値をコピーし変更列だけ上書き
-        updated[col.TASK_NAME - 1]  = newTaskName;
-        if (newStatus !== null) updated[col.STATUS - 1] = newStatus;
-        updated[col.START - 1]      = newStart;
-        updated[col.END - 1]        = newEnd;
-        updated[col.ASSIGNEE - 1]   = assignee;
-        updated[col.MEMO - 1]       = memo;
-        updated[col.LAST_SYNC - 1]  = syncTime;
-        updated[col.UPDATED_BY - 1] = creator;
-        pendingUpdates.push({ rowNum: entry.rowNum, values: updated });
-        Logger.log("更新: row=" + entry.rowNum + " [" + newTaskName + "]" + (statusChanged ? " ステータス→" + newStatus : ""));
-        updatedCount++;
-      }
-    } else {
-      // ---- 新規行 ----
-      const newRow = new Array(NUM_COLS).fill("");
-      newRow[col.TASK_NAME - 1]  = newTaskName;
-      newRow[col.START - 1]      = newStart;
-      newRow[col.END - 1]        = newEnd;
-      newRow[col.STATUS - 1]     = newStatus || "未着手";
-      newRow[col.ASSIGNEE - 1]   = assignee;
-      newRow[col.MEMO - 1]       = memo;
-      newRow[col.EVENT_ID - 1]   = eventId;
-      newRow[col.LAST_SYNC - 1]  = syncTime;
-      newRow[col.CREATED_BY - 1] = creator;
-      newRow[col.UPDATED_BY - 1] = creator;
-      pendingNewRows.push(newRow);
-      addedCount++;
+    } catch (e) {
+      Logger.log("イベント処理失敗のためスキップ: eventId=" + eventId + " " + e.message);
+      eventErrors.push({ eventId: eventId, message: e.message });
     }
   });
+
+  if (eventErrors.length > 0) {
+    const summary = eventErrors.length + "件のイベント処理でエラー: " +
+      eventErrors.slice(0, 5).map(function(er) { return er.eventId + "(" + er.message + ")"; }).join(" / ") +
+      (eventErrors.length > 5 ? " ...他" + (eventErrors.length - 5) + "件" : "");
+    Logger.log(summary);
+    _notifyError("_syncCalendarToSheetsBody（イベント単位エラー）", new Error(summary));
+  }
 
   // バッチ書き込み：更新行（行ごとに1回 setValues）
   pendingUpdates.forEach(function(u) {
@@ -365,7 +393,9 @@ function _syncCalendarToSheetsBody() {
   Logger.log("Calendar -> Sheets 同期完了: " + addedCount + "件追加 / " + updatedCount + "件更新");
 
   // カレンダーから削除されたイベントをSheetsからも削除
-  _removeDeletedEvents(sheet, events, eventIdToRow, uniqueCalIds);
+  // now を渡すことで、上のイベント取得範囲（start/end）と削除判定範囲の基準時刻を統一する
+  // （forEachループの実行時間が伸びても、範囲がズレないようにするため）
+  _removeDeletedEvents(sheet, events, eventIdToRow, uniqueCalIds, now);
 }
 
 /**
@@ -374,11 +404,11 @@ function _syncCalendarToSheetsBody() {
  *   「範囲外なだけ」なのか判断できない。開始日時（B列）が読める行はそのレンジ判定でスキップする。
  *   終日タスク（B列が仕様上つねに空欄）やフォーマット不正の行はレンジ判定ができないため、
  *   代わりに calendarIds 全件を対象に getEventById による実在確認（日付に縛られない）にフォールバックする。
+ * now は呼び出し元（_syncCalendarToSheetsBody）のイベント取得範囲計算と同一の基準時刻を渡すこと。
  */
-function _removeDeletedEvents(sheet, calendarEvents, eventIdToRow, calendarIds) {
+function _removeDeletedEvents(sheet, calendarEvents, eventIdToRow, calendarIds, now) {
   if (eventIdToRow.size === 0) return;
 
-  const now       = new Date();
   const syncStart = new Date(now.getTime() - CONFIG.SYNC_DAYS_BACK  * 24 * 60 * 60 * 1000);
   const syncEnd   = new Date(now.getTime() + CONFIG.SYNC_DAYS_AHEAD * 24 * 60 * 60 * 1000);
 
@@ -392,8 +422,11 @@ function _removeDeletedEvents(sheet, calendarEvents, eventIdToRow, calendarIds) 
     const startDate = _sheetDateToCalendarDate(startVal);
 
     if (!startDate) {
-      // 終日タスク／フォーマット不正行：日付で範囲内外を判断できないので直接検索で実在確認する
-      if (_findEventInCalendars(eventId, calendarIds)) return; // 取得範囲外にまだ存在する → 削除しない
+      // 終日タスク／フォーマット不正行：日付で範囲内外を判断できないので直接検索で実在確認する。
+      // CalendarApp.getEventById() は削除済み（status:"cancelled"のトゥームストーン）イベントでも
+      // 非nullを返すことがあるため、見つかった場合でも Advanced Service の status で真偽を確認する。
+      const found = _findEventInCalendars(eventId, calendarIds);
+      if (found && _isEventActiveViaAdvancedService(found.calendar.getId(), eventId)) return; // 有効なイベントとして存在する → 削除しない
       rowsToDelete.push(row);
       return;
     }
@@ -801,6 +834,24 @@ function _getEventColorAndLabelViaAdvancedService(calendarId, eventId) {
   } catch(e) {
     Logger.log("Advanced Serviceでの色/ラベル取得失敗: " + eventId + " " + e.message);
     return { colorId: null, eventLabelId: null };
+  }
+}
+
+/**
+ * Advanced Service (REST API) でイベントの status を確認し、真に有効なイベントかを判定する。
+ * CalendarApp.getEventById() は削除（キャンセル）済みイベントでも一定期間は非nullのオブジェクトを
+ * 返すことがあり（Calendar側は削除を status:"cancelled" のトゥームストーンとして保持するため）、
+ * 実在確認としては不十分。_removeDeletedEvents の削除判定でのみ、この関数で status を併せて確認する。
+ * 判定できない場合（API通信エラー等、cancelledと確定できない場合）は誤削除を避けるため true（有効）を返す。
+ */
+function _isEventActiveViaAdvancedService(calendarId, eventId) {
+  try {
+    const rawEventId = eventId.split("@")[0];
+    const advEvent = Calendar.Events.get(calendarId, rawEventId, { fields: "status" });
+    return advEvent.status !== "cancelled";
+  } catch(e) {
+    Logger.log("Advanced Serviceでのstatus確認失敗（安全側に倒し有効扱いとする）: " + eventId + " " + e.message);
+    return true;
   }
 }
 
