@@ -166,6 +166,19 @@ GASの CalendarApp 経由では、UIで手動変更したイベント色を `get
 
 → **新しく担当者を追加する場合、そのカレンダーに4つのラベル（未着手/進行中/完了/キャンセル）を作成しておくことが、読み取り側（項目6）だけでなく書き込み側の色表示にも必要。**
 
+### 8. `events.forEach` 内の未捕捉例外、および `CalendarApp.getEventById()` の削除済みイベント誤検知により、Calendar削除がSheetsに反映されないことがあった（Issue #31再発）
+
+**症状**: Issue #31（終日タスク限定の別原因、155166aで対応済み）の修正後も、Calendar側でイベントを削除してもSheets側の行が消えない事象が再発した。原因は2つあり、実機検証で切り分けた。
+
+**原因1（副次的に発見・修正）**: `_syncCalendarToSheetsBody()`内の`events.forEach(...)`（イベントごとの差分検出・更新/新規行の組み立て）にはtry/catchが無く、ループ内で1件でも例外が発生すると forEach 全体、ひいては `_syncCalendarToSheetsBody` 全体がそこで中断される構造になっていた。削除判定を行う `_removeDeletedEvents()` はこのforEachの**後**で呼ばれる設計のため、ループが中断すると一度も実行されない。ステータス判定に使う `_getEventColorAndLabelViaAdvancedService()` / `_getCalendarLabelMaps()` 自体は内部でtry/catch済みで例外を握りつぶす設計だったため直接の原因ではなかったが、その前後で `CalendarApp` 経由でイベントオブジェクトのプロパティに直接アクセスする呼び出し（`event.getTitle()` / `isAllDayEvent()` / `getStartTime()` / `getEndTime()` / `getDescription()` / `getCreators()` / `getColor()` / `getId()`）は無防備で、対象イベントが同一実行中にCalendar側で削除・変更されると失敗しうる。これを個別のtry/catchで保護し、失敗したイベントだけスキップするよう修正（エラーはループ後にまとめて1回だけ通知）。
+
+**原因2（実際の再発原因）**: 原因1の修正をpushしてもなお、終日タスクを削除したケースで再現した。`_removeDeletedEvents`は日付で範囲内外を判断できない行（終日タスク／フォーマット不正行）を`_findEventInCalendars()`で直接実在確認するが、この関数は`cal.getEventById(eventId)`の**戻り値が非nullかどうかだけ**を実在の判定基準にしていた。Google Calendarは削除されたイベントを即座に完全削除するのではなく、`status: "cancelled"`のトゥームストーンとしてしばらく保持する仕様のため、`CalendarApp.getEventById()`は**削除済みのイベントでも非nullのオブジェクトを返すことがある**。結果、終日タスクを削除しても`_findEventInCalendars`が誤って「まだ存在する」と判定し、`_removeDeletedEvents`が該当行を削除対象に含めていなかった。
+
+**解決策**: 新設した`_isEventActiveViaAdvancedService(calendarId, eventId)`で、Calendar Advanced Serviceの`Calendar.Events.get(..., {fields: "status"})`を呼び、`status !== "cancelled"`かどうかで真の有効性を確認する。`_removeDeletedEvents`の終日タスク用フォールバック分岐で、`_findEventInCalendars`が見つけた場合でもこのstatus確認を併せて行い、`status === "cancelled"`なら削除対象とみなすようにした。API通信エラー等でstatusを確定できない場合は、誤削除（データ消失）を避けるため「有効（削除しない）」を返す安全側設計にしている。`_findEventInCalendars`自体（他の4箇所の呼び出し元）は変更していない。
+
+→ **`CalendarApp.getEventById()`の戻り値の非null判定だけを「イベントが存在する」根拠にしないこと。削除済みイベントの検知（=本当に消えたかどうかの確認）が必要な場面では、Advanced Serviceで`status`フィールドを確認すること。CalendarAppの型はこのstatus情報を公開していない。**
+→ **`events.forEach`のようなイベント単位ループを新しく書く/触るときは、CalendarAppのイベントオブジェクトへの直接アクセスも「同一実行中に対象がCalendar側で削除/変更されて失敗しうる」ことを前提に、必ずイベント単位のtry/catchで保護すること。**
+
 ## 既知の未対応課題
 
 1. **Sheets側で行ごと削除した場合、Calendar側に反映されない**（重要度：中）— タスク名セルを空にする「中身だけ消す削除」は対応済み（担当者の状態に関わらず動作する）。行削除自体は `onChange` トリガーが必要だが実装コストが高いため**運用ルールで対応**（行削除禁止・中身消しで代替）
