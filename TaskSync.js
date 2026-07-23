@@ -128,8 +128,9 @@ function resetAndResyncToCalendar() {
 
     // Step 2: シートの全行を再同期
     let createdCount = 0;
+    const labelCache = new Map();
     for (let r = CONFIG.DATA_START_ROW; r <= lastRow; r++) {
-      _syncRowToCalendar(sheet, r);
+      _syncRowToCalendar(sheet, r, labelCache);
       createdCount++;
     }
 
@@ -159,10 +160,11 @@ function onEditTrigger(e) {
     return;
   }
   try {
+    const labelCache = new Map();
     for (let i = 0; i < numRows; i++) {
       const row = startRow + i;
       if (row <= CONFIG.HEADER_ROW) continue;
-      _syncRowToCalendar(sheet, row);
+      _syncRowToCalendar(sheet, row, labelCache);
     }
   } finally {
     lock.releaseLock();
@@ -289,7 +291,7 @@ function _syncCalendarToSheetsBody() {
     if (newStatus === null) {
       const adv = _getEventColorAndLabelViaAdvancedService(sourceCalId, eventId);
       if (adv.eventLabelId) {
-        const labelName = _getLabelNameMap(sourceCalId, labelNameCache).get(adv.eventLabelId);
+        const labelName = _getCalendarLabelMaps(sourceCalId, labelNameCache).idToName.get(adv.eventLabelId);
         if (labelName && validStatuses.has(labelName)) {
           newStatus  = labelName;
           resolvedBy = "ラベル(" + labelName + ")";
@@ -420,7 +422,7 @@ function _removeDeletedEvents(sheet, calendarEvents, eventIdToRow, calendarIds) 
  * 指定行のタスクをCalendarに反映（作成 or 更新 or 削除）
  * 担当者マスタに登録されていない担当者の場合はスキップ。
  */
-function _syncRowToCalendar(sheet, row) {
+function _syncRowToCalendar(sheet, row, labelCache) {
   const col      = CONFIG.COL;
   const taskName = sheet.getRange(row, col.TASK_NAME).getValue();
   const startVal = sheet.getRange(row, col.START).getDisplayValue();
@@ -453,7 +455,8 @@ function _syncRowToCalendar(sheet, row) {
     return;
   }
 
-  const targetCal = CalendarApp.getCalendarById(calendarMap.get(assignee));
+  const targetCalId = calendarMap.get(assignee);
+  const targetCal   = CalendarApp.getCalendarById(targetCalId);
   if (!targetCal) {
     Logger.log("カレンダーが見つかりません (担当者: " + assignee + ")");
     return;
@@ -524,6 +527,10 @@ function _syncRowToCalendar(sheet, row) {
         } else {
           Logger.log("警告: row=" + row + " 未対応のステータス「" + status + "」のためCalendar色を更新しませんでした");
         }
+        // ラベル機能が有効なカレンダーでは setColor() だけでは色が反映されないため、
+        // ステータス名と一致するラベルがあれば eventLabelId も直接書き込む（Issue #35）
+        const labelId = _getCalendarLabelMaps(targetCalId, labelCache).nameToId.get(status);
+        if (labelId) _setEventLabel(targetCalId, ev.getId(), labelId);
         sheet.getRange(row, col.LAST_SYNC).setValue(new Date());
         sheet.getRange(row, col.UPDATED_BY).setValue(operator);
         Logger.log("更新: " + title + " by " + operator);
@@ -548,6 +555,10 @@ function _syncRowToCalendar(sheet, row) {
     } else {
       Logger.log("警告: row=" + row + " 未対応のステータス「" + status + "」のためCalendar色を設定しませんでした");
     }
+    // ラベル機能が有効なカレンダーでは setColor() だけでは色が反映されないため、
+    // ステータス名と一致するラベルがあれば eventLabelId も直接書き込む（Issue #35）
+    const labelId = _getCalendarLabelMaps(targetCalId, labelCache).nameToId.get(status);
+    if (labelId) _setEventLabel(targetCalId, newEvent.getId(), labelId);
     sheet.getRange(row, col.EVENT_ID).setValue(newEvent.getId());
     sheet.getRange(row, col.LAST_SYNC).setValue(new Date());
     sheet.getRange(row, col.CREATED_BY).setValue(operator);
@@ -794,21 +805,41 @@ function _getEventColorAndLabelViaAdvancedService(calendarId, eventId) {
 }
 
 /**
- * 指定カレンダーの labelProperties.eventLabels を取得し、labelId → labelName の Map を返す。
- * cache（calendarId → Map）で同一実行内の再取得を避ける。取得失敗時は空のMapを返す。
+ * Calendar Advanced Service (REST API) でイベントに eventLabelId を直接書き込む。
+ * ラベル機能が有効なカレンダーでは CalendarApp.setColor() が色を反映しないための回避策（Issue #35）。
+ * 失敗してもログのみ（色付けは見た目の補助のため、タスク作成/更新自体は止めない）。
  */
-function _getLabelNameMap(calendarId, cache) {
+function _setEventLabel(calendarId, eventId, labelId) {
+  try {
+    const rawEventId = eventId.split("@")[0];
+    Calendar.Events.patch({ eventLabelId: labelId }, calendarId, rawEventId, { eventLabelVersion: 1 });
+  } catch(e) {
+    Logger.log("ラベル書き込み失敗: " + eventId + " " + e.message);
+  }
+}
+
+/**
+ * 指定カレンダーの labelProperties.eventLabels を取得し、
+ * { idToName: Map(labelId->labelName), nameToId: Map(labelName->labelId) } を返す。
+ * cache（calendarId → 結果）で同一実行内の再取得を避ける。取得失敗時は両方空のMapを返す。
+ */
+function _getCalendarLabelMaps(calendarId, cache) {
   if (cache.has(calendarId)) return cache.get(calendarId);
-  const map = new Map();
+  const idToName = new Map();
+  const nameToId = new Map();
   try {
     const cal    = Calendar.Calendars.get(calendarId, { fields: "labelProperties" });
     const labels = (cal.labelProperties && cal.labelProperties.eventLabels) || [];
-    labels.forEach(function(label) { map.set(label.id, label.name); });
+    labels.forEach(function(label) {
+      idToName.set(label.id, label.name);
+      nameToId.set(label.name, label.id);
+    });
   } catch(e) {
     Logger.log("ラベル情報取得失敗: " + calendarId + " " + e.message);
   }
-  cache.set(calendarId, map);
-  return map;
+  const result = { idToName: idToName, nameToId: nameToId };
+  cache.set(calendarId, result);
+  return result;
 }
 
 /**
