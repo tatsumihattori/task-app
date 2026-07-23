@@ -11,7 +11,6 @@
 // ==================== 設定 ====================
 const CONFIG = {
   SHEET_NAME: "タスク",          // シート名（必要に応じて変更）
-  CALENDAR_ID: "c_60e6f80451cdf1045be018eff7cfa2fbe19fac4bc8dec036d29c8701eb9df4fe@group.calendar.google.com",
   ERROR_NOTIFY_EMAIL: "tatsumi.hattori@laboratory.work",  // エラー通知先（空文字で無効化）
 
   // ステータスごとのCalendarイベント色（CalendarApp.EventColor の数値文字列）
@@ -55,7 +54,6 @@ const CONFIG = {
  * ※ 一度だけ手動で実行してください
  */
 function setup() {
-  // _createHeader();
   _registerTriggers();
   SpreadsheetApp.getUi().alert(
     "✅ セットアップ完了！\n\n" +
@@ -107,20 +105,8 @@ function resetAndResyncToCalendar() {
       const assignee = String(rowData[col.ASSIGNEE - 1]).trim();
       if (!eventId) return;
 
-      try {
-        let deleted = false;
-        if (assignee && calendarMap.has(assignee)) {
-          const cal = CalendarApp.getCalendarById(calendarMap.get(assignee));
-          const ev  = cal ? cal.getEventById(eventId) : null;
-          if (ev) { ev.deleteEvent(); deleted = true; }
-        }
-        if (!deleted) {
-          const found = _findEventInCalendars(eventId, allCalIds);
-          if (found) found.event.deleteEvent();
-        }
-      } catch(e) {
-        Logger.log("削除エラー: " + eventId + " " + e.message);
-      }
+      const preferredCalId = (assignee && calendarMap.has(assignee)) ? calendarMap.get(assignee) : null;
+      _deleteEventAcrossCalendars(eventId, allCalIds, preferredCalId);
 
       sheet.getRange(CONFIG.DATA_START_ROW + i, col.EVENT_ID).clearContent();
       deletedCount++;
@@ -130,7 +116,7 @@ function resetAndResyncToCalendar() {
     let createdCount = 0;
     const labelCache = new Map();
     for (let r = CONFIG.DATA_START_ROW; r <= lastRow; r++) {
-      _syncRowToCalendar(sheet, r, labelCache);
+      _syncRowToCalendar(sheet, r, labelCache, calendarMap);
       createdCount++;
     }
 
@@ -160,11 +146,12 @@ function onEditTrigger(e) {
     return;
   }
   try {
-    const labelCache = new Map();
+    const labelCache  = new Map();
+    const calendarMap = _getAssigneeCalendarMap();
     for (let i = 0; i < numRows; i++) {
       const row = startRow + i;
       if (row <= CONFIG.HEADER_ROW) continue;
-      _syncRowToCalendar(sheet, row, labelCache);
+      _syncRowToCalendar(sheet, row, labelCache, calendarMap);
     }
   } finally {
     lock.releaseLock();
@@ -290,7 +277,8 @@ function _syncCalendarToSheetsBody() {
     // イベント単位でtry/catchし、失敗したイベントだけスキップして次へ進む。
     // 既存行は前回値を維持、新規イベントは次回同期で再試行される（いずれも安全側）。
     try {
-      const newTaskName = _sanitizeForSheet(event.getTitle());
+      const rawTitle    = event.getTitle();
+      const newTaskName = _sanitizeForSheet(rawTitle);
       // 終日イベントは開始日時を空欄のまま保つ（Sheets→Calendar側の「開始日時が空＝終日タスク」という表現を維持する）
       const newStart    = event.isAllDayEvent() ? "" : _formatDateTime(event.getStartTime());
       const newEnd      = event.isAllDayEvent() ? "" : _formatDateTime(event.getEndTime());
@@ -319,7 +307,7 @@ function _syncCalendarToSheetsBody() {
         }
       }
 
-      Logger.log("色確認: [" + event.getTitle() + "] " + (resolvedBy ? resolvedBy + " → " + newStatus : "(未対応)"));
+      Logger.log("色確認: [" + rawTitle + "] " + (resolvedBy ? resolvedBy + " → " + newStatus : "(未対応)"));
 
       if (eventIdToEntry.has(eventId)) {
         // ---- 既存行：差分チェック（読み取り済みデータを使用） ----
@@ -393,9 +381,9 @@ function _syncCalendarToSheetsBody() {
   Logger.log("Calendar -> Sheets 同期完了: " + addedCount + "件追加 / " + updatedCount + "件更新");
 
   // カレンダーから削除されたイベントをSheetsからも削除
-  // now を渡すことで、上のイベント取得範囲（start/end）と削除判定範囲の基準時刻を統一する
+  // start/end をそのまま渡すことで、上のイベント取得範囲と削除判定範囲を同一のものにする
   // （forEachループの実行時間が伸びても、範囲がズレないようにするため）
-  _removeDeletedEvents(sheet, events, eventIdToRow, uniqueCalIds, now);
+  _removeDeletedEvents(sheet, events, eventIdToRow, uniqueCalIds, start, end);
 }
 
 /**
@@ -404,13 +392,10 @@ function _syncCalendarToSheetsBody() {
  *   「範囲外なだけ」なのか判断できない。開始日時（B列）が読める行はそのレンジ判定でスキップする。
  *   終日タスク（B列が仕様上つねに空欄）やフォーマット不正の行はレンジ判定ができないため、
  *   代わりに calendarIds 全件を対象に getEventById による実在確認（日付に縛られない）にフォールバックする。
- * now は呼び出し元（_syncCalendarToSheetsBody）のイベント取得範囲計算と同一の基準時刻を渡すこと。
+ * syncStart/syncEnd は呼び出し元（_syncCalendarToSheetsBody）のイベント取得範囲と同一のものを渡すこと。
  */
-function _removeDeletedEvents(sheet, calendarEvents, eventIdToRow, calendarIds, now) {
+function _removeDeletedEvents(sheet, calendarEvents, eventIdToRow, calendarIds, syncStart, syncEnd) {
   if (eventIdToRow.size === 0) return;
-
-  const syncStart = new Date(now.getTime() - CONFIG.SYNC_DAYS_BACK  * 24 * 60 * 60 * 1000);
-  const syncEnd   = new Date(now.getTime() + CONFIG.SYNC_DAYS_AHEAD * 24 * 60 * 60 * 1000);
 
   const activeIds = new Set(calendarEvents.map(function(e) { return e.event.getId(); }));
 
@@ -454,8 +439,10 @@ function _removeDeletedEvents(sheet, calendarEvents, eventIdToRow, calendarIds, 
 /**
  * 指定行のタスクをCalendarに反映（作成 or 更新 or 削除）
  * 担当者マスタに登録されていない担当者の場合はスキップ。
+ * calendarMap（担当者名→カレンダーID）は呼び出し元（onEditTrigger/resetAndResyncToCalendar）が
+ * ループの外で1回だけ取得したものを受け取る（行ごとにマスタシートを再読み込みしないため）。
  */
-function _syncRowToCalendar(sheet, row, labelCache) {
+function _syncRowToCalendar(sheet, row, labelCache, calendarMap) {
   const col      = CONFIG.COL;
   const taskName = sheet.getRange(row, col.TASK_NAME).getValue();
   const startVal = sheet.getRange(row, col.START).getDisplayValue();
@@ -468,15 +455,11 @@ function _syncRowToCalendar(sheet, row, labelCache) {
   const client   = sheet.getRange(row, col.CLIENT).getValue();
   const eventId  = sheet.getRange(row, col.EVENT_ID).getValue();
 
-  const calendarMap = _getAssigneeCalendarMap();
-
   // タスク名が空なら削除扱い（担当者の状態に関わらず、全カレンダーから検索して削除）
   if (!taskName) {
     if (eventId) {
-      try {
-        const found = _findEventInCalendars(eventId, [...calendarMap.values()]);
-        if (found) found.event.deleteEvent();
-      } catch(e) {}
+      const preferredCalId = (assignee && calendarMap.has(assignee)) ? calendarMap.get(assignee) : null;
+      _deleteEventAcrossCalendars(eventId, [...calendarMap.values()], preferredCalId);
       sheet.getRange(row, col.EVENT_ID).clearContent();
     }
     return;
@@ -554,16 +537,7 @@ function _syncRowToCalendar(sheet, row, labelCache) {
           ev.setTime(startDate, endDate);
         }
         ev.setDescription(description);
-        const color = CONFIG.STATUS_COLORS[status];
-        if (color) {
-          ev.setColor(color);
-        } else {
-          Logger.log("警告: row=" + row + " 未対応のステータス「" + status + "」のためCalendar色を更新しませんでした");
-        }
-        // ラベル機能が有効なカレンダーでは setColor() だけでは色が反映されないため、
-        // ステータス名と一致するラベルがあれば eventLabelId も直接書き込む（Issue #35）
-        const labelId = _getCalendarLabelMaps(targetCalId, labelCache).nameToId.get(status);
-        if (labelId) _setEventLabel(targetCalId, ev.getId(), labelId);
+        _applyStatusColorAndLabel(ev, eventId, targetCalId, status, row, labelCache);
         sheet.getRange(row, col.LAST_SYNC).setValue(new Date());
         sheet.getRange(row, col.UPDATED_BY).setValue(operator);
         Logger.log("更新: " + title + " by " + operator);
@@ -571,9 +545,7 @@ function _syncRowToCalendar(sheet, row, labelCache) {
       }
 
       // 別カレンダーに存在する（担当者変更）→ 旧イベントを削除して再作成
-      const found = _findEventInCalendars(eventId, allCalIds);
-      if (found) {
-        try { found.event.deleteEvent(); } catch(ignore) {}
+      if (_deleteEventAcrossCalendars(eventId, allCalIds, null)) {
         Logger.log("担当者変更により旧カレンダーからイベント削除");
       }
     }
@@ -582,17 +554,9 @@ function _syncRowToCalendar(sheet, row, labelCache) {
     const newEvent = isAllDay
       ? targetCal.createAllDayEvent(title, startDate, { description: description })
       : targetCal.createEvent(title, startDate, endDate, { description: description });
-    const color = CONFIG.STATUS_COLORS[status];
-    if (color) {
-      newEvent.setColor(color);
-    } else {
-      Logger.log("警告: row=" + row + " 未対応のステータス「" + status + "」のためCalendar色を設定しませんでした");
-    }
-    // ラベル機能が有効なカレンダーでは setColor() だけでは色が反映されないため、
-    // ステータス名と一致するラベルがあれば eventLabelId も直接書き込む（Issue #35）
-    const labelId = _getCalendarLabelMaps(targetCalId, labelCache).nameToId.get(status);
-    if (labelId) _setEventLabel(targetCalId, newEvent.getId(), labelId);
-    sheet.getRange(row, col.EVENT_ID).setValue(newEvent.getId());
+    const newEventId = newEvent.getId();
+    _applyStatusColorAndLabel(newEvent, newEventId, targetCalId, status, row, labelCache);
+    sheet.getRange(row, col.EVENT_ID).setValue(newEventId);
     sheet.getRange(row, col.LAST_SYNC).setValue(new Date());
     sheet.getRange(row, col.CREATED_BY).setValue(operator);
     sheet.getRange(row, col.UPDATED_BY).setValue(operator);
@@ -692,40 +656,6 @@ function _notifyUpcomingDeadlinesBody() {
 }
 
 /**
- * ヘッダー行を作成
- */
-function _createHeader() {
-  const sheet = _getOrCreateSheet();
-  const headers = ["タスク名", "開始日時", "終了日時", "ステータス", "担当者", "メモ/説明", "Event ID (自動)", "最終同期 (自動)", "作成者 (自動)", "最終更新者 (自動)"];
-  const headerRange = sheet.getRange(1, 1, 1, headers.length);
-
-  headerRange.setValues([headers]);
-  headerRange.setFontWeight("bold");
-  headerRange.setBackground("#4A90D9");
-  headerRange.setFontColor("#FFFFFF");
-  sheet.setFrozenRows(1);
-
-  sheet.setColumnWidth(1, 200); // タスク名
-  sheet.setColumnWidth(2, 160); // 開始日時
-  sheet.setColumnWidth(3, 160); // 終了日時
-  sheet.setColumnWidth(4, 100); // ステータス
-  sheet.setColumnWidth(5, 120); // 担当者
-  sheet.setColumnWidth(6, 220); // メモ
-  sheet.setColumnWidth(7, 220); // Event ID
-  sheet.setColumnWidth(8, 160); // 最終同期
-  sheet.setColumnWidth(9, 180); // 作成者
-  sheet.setColumnWidth(10, 180); // 最終更新者
-
-  // ステータスのドロップダウン
-  const statusRule = SpreadsheetApp.newDataValidation()
-    .requireValueInList(["未着手", "進行中", "完了", "キャンセル"], true)
-    .build();
-  sheet.getRange(CONFIG.DATA_START_ROW, CONFIG.COL.STATUS, 1000, 1).setDataValidation(statusRule);
-
-  SpreadsheetApp.flush();
-}
-
-/**
  * トリガーを登録（重複防止あり）
  */
 function _registerTriggers() {
@@ -783,16 +713,22 @@ function _sheetDateToCalendarDate(val) {
 }
 
 /**
- * 担当者マスタシート（GID: 881583119）を読み込み、担当者名 → カレンダーID の Map を返す
+ * 担当者マスタシート（GID: 881583119）のA〜C列（担当者名・カレンダーID・ChatユーザーID）を読み込む。
+ * シートが無い/データ行が無い場合は空配列を返す。
  */
-function _getAssigneeCalendarMap() {
+function _readAssigneeMasterRows() {
   const sheet = SpreadsheetApp.getActive().getSheets()
     .find(function(s) { return s.getSheetId() === 881583119; });
-  if (!sheet || sheet.getLastRow() < 2) return new Map();
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  return sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
+}
 
-  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues();
-  const map  = new Map();
-  data.forEach(function(row) {
+/**
+ * 担当者マスタシートを読み込み、担当者名 → カレンダーID の Map を返す
+ */
+function _getAssigneeCalendarMap() {
+  const map = new Map();
+  _readAssigneeMasterRows().forEach(function(row) {
     const name  = String(row[0]).trim();
     const calId = String(row[1]).trim();
     if (name && calId) map.set(name, calId);
@@ -801,22 +737,25 @@ function _getAssigneeCalendarMap() {
 }
 
 /**
- * 担当者マスタシート（GID: 881583119）のC列を読み込み、担当者名 → ChatユーザーID（"users/xxxx"形式）の Map を返す
+ * 担当者マスタシートのC列を読み込み、担当者名 → ChatユーザーID（"users/xxxx"形式）の Map を返す
  * C列が未入力の担当者はMapに含まれない（呼び出し側で担当者名へのフォールバックが必要）
  */
 function _getAssigneeChatUserMap() {
-  const sheet = SpreadsheetApp.getActive().getSheets()
-    .find(function(s) { return s.getSheetId() === 881583119; });
-  if (!sheet || sheet.getLastRow() < 2) return new Map();
-
-  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
-  const map  = new Map();
-  data.forEach(function(row) {
+  const map = new Map();
+  _readAssigneeMasterRows().forEach(function(row) {
     const name       = String(row[0]).trim();
     const chatUserId = String(row[2] || "").trim();
     if (name && chatUserId) map.set(name, chatUserId);
   });
   return map;
+}
+
+/**
+ * CalendarApp由来のEvent ID（"xxxx@google.com"形式）を、Advanced Service (REST API) が
+ * 要求する素のID（"@"以降を除いたもの）に変換する。
+ */
+function _toRawEventId(eventId) {
+  return eventId.split("@")[0];
 }
 
 /**
@@ -826,9 +765,7 @@ function _getAssigneeChatUserMap() {
  */
 function _getEventColorAndLabelViaAdvancedService(calendarId, eventId) {
   try {
-    // CalendarApp由来のIDは "xxxx@google.com" 形式だが、
-    // Advanced Service (REST API) は "@" 以降を除いた素のIDを要求するため変換する
-    const rawEventId = eventId.split("@")[0];
+    const rawEventId = _toRawEventId(eventId);
     const advEvent = Calendar.Events.get(calendarId, rawEventId, { fields: "colorId,eventLabelId" });
     return { colorId: advEvent.colorId || null, eventLabelId: advEvent.eventLabelId || null };
   } catch(e) {
@@ -846,7 +783,7 @@ function _getEventColorAndLabelViaAdvancedService(calendarId, eventId) {
  */
 function _isEventActiveViaAdvancedService(calendarId, eventId) {
   try {
-    const rawEventId = eventId.split("@")[0];
+    const rawEventId = _toRawEventId(eventId);
     const advEvent = Calendar.Events.get(calendarId, rawEventId, { fields: "status" });
     return advEvent.status !== "cancelled";
   } catch(e) {
@@ -862,7 +799,7 @@ function _isEventActiveViaAdvancedService(calendarId, eventId) {
  */
 function _setEventLabel(calendarId, eventId, labelId) {
   try {
-    const rawEventId = eventId.split("@")[0];
+    const rawEventId = _toRawEventId(eventId);
     Calendar.Events.patch({ eventLabelId: labelId }, calendarId, rawEventId, { eventLabelVersion: 1 });
   } catch(e) {
     Logger.log("ラベル書き込み失敗: " + eventId + " " + e.message);
@@ -891,6 +828,43 @@ function _getCalendarLabelMaps(calendarId, cache) {
   const result = { idToName: idToName, nameToId: nameToId };
   cache.set(calendarId, result);
   return result;
+}
+
+/**
+ * eventIdのイベントを削除する。preferredCalId（担当者の現在のカレンダー）が分かっていれば
+ * まずそこだけを直接検索して削除を試み、見つからなければ calendarIds 全体を
+ * _findEventInCalendars でフォールバック検索する（Issue #15：3箇所に散在していた削除ロジックの共通化）。
+ * 削除できた場合は true、見つからない/削除失敗の場合は false を返す（例外は投げない）。
+ */
+function _deleteEventAcrossCalendars(eventId, calendarIds, preferredCalId) {
+  try {
+    if (preferredCalId) {
+      const cal = CalendarApp.getCalendarById(preferredCalId);
+      const ev  = cal ? cal.getEventById(eventId) : null;
+      if (ev) { ev.deleteEvent(); return true; }
+    }
+    const found = _findEventInCalendars(eventId, calendarIds);
+    if (found) { found.event.deleteEvent(); return true; }
+  } catch(e) {
+    Logger.log("削除エラー: " + eventId + " " + e.message);
+  }
+  return false;
+}
+
+/**
+ * イベントにステータス色（setColor）を設定し、ラベル機能が有効なカレンダーであれば
+ * eventLabelId も直接書き込む（Issue #35。setColor()だけではラベル有効カレンダーに反映されないため）。
+ * 未対応のステータス文字列の場合は警告ログのみを出し、色設定はスキップする。
+ */
+function _applyStatusColorAndLabel(event, eventId, calendarId, status, row, labelCache) {
+  const color = CONFIG.STATUS_COLORS[status];
+  if (color) {
+    event.setColor(color);
+  } else {
+    Logger.log("警告: row=" + row + " 未対応のステータス「" + status + "」のためCalendar色を設定しませんでした");
+  }
+  const labelId = _getCalendarLabelMaps(calendarId, labelCache).nameToId.get(status);
+  if (labelId) _setEventLabel(calendarId, eventId, labelId);
 }
 
 /**
