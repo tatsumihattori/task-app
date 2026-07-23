@@ -8,7 +8,7 @@
 Google Sheets と Google Calendar の双方向タスク同期システム。Google Apps Script (GAS) で実装。
 
 - **Sheets → Calendar**: セル編集時に即座反映（`onEdit` インストーラブルトリガー）
-- **Calendar → Sheets**: 10分ごとのポーリングで反映（時間ベーストリガー）
+- **Calendar → Sheets**: 10分ごとのポーリングで反映（時間ベーストリガー）。スプレッドシートのカスタムメニュー「TaskSync」からも手動即時実行可能（`onOpen()` の simple trigger でメニュー登録、実体は `manualSyncCalendarToSheets()` → `_syncCalendarToSheetsBody()`。Issue #40）
 - **期日通知**: 期日が近いタスクをGoogle Chatに毎日通知（時間ベーストリガー、`notifyUpcomingDeadlines`）
 
 ## シート構成

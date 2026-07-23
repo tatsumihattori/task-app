@@ -50,6 +50,16 @@ const CONFIG = {
 // ==================== メインエントリ ====================
 
 /**
+ * スプレッドシートを開いたときに独自メニューを追加する（simple trigger）
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("TaskSync")
+    .addItem("Calendar → Sheets を今すぐ同期", "manualSyncCalendarToSheets")
+    .addToUi();
+}
+
+/**
  * 初回セットアップ：ヘッダー作成 & トリガー登録
  * ※ 一度だけ手動で実行してください
  */
@@ -173,6 +183,28 @@ function syncCalendarToSheets() {
     _syncCalendarToSheetsBody();
   } catch(e) {
     _notifyError("syncCalendarToSheets", e);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * メニューからの手動実行：CalendarからSheetsへの同期を即時実行する
+ * （10分ごとの定期実行を待たずに反映を確認したい場合用）
+ */
+function manualSyncCalendarToSheets() {
+  const ui = SpreadsheetApp.getUi();
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    ui.alert("別の同期処理が実行中です。しばらく待ってから再試行してください。");
+    return;
+  }
+  try {
+    _syncCalendarToSheetsBody();
+    ui.alert("✅ Calendar → Sheets の同期が完了しました。");
+  } catch (e) {
+    _notifyError("manualSyncCalendarToSheets", e);
+    ui.alert("エラーが発生しました: " + e.message);
   } finally {
     lock.releaseLock();
   }
