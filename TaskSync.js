@@ -70,7 +70,8 @@ function setup() {
     "・Sheetsを編集すると自動でCalendarに反映されます\n" +
     "・CalendarからSheetsへの同期は10分ごとに実行されます\n" +
     "・期日が近いタスクのGoogle Chat通知は毎日9時に実行されます\n" +
-    "　（スクリプトプロパティ CHAT_WEBHOOK_URL が未設定の場合は通知されません）"
+    "　（スクリプトプロパティ CHAT_WEBHOOK_URL が未設定の場合は通知されません）\n" +
+    "・未着手・進行中の終日タスクの日付は毎日0時に今日の日付へ自動更新されます"
   );
 }
 
@@ -219,6 +220,25 @@ function notifyUpcomingDeadlines() {
     _notifyUpcomingDeadlinesBody();
   } catch(e) {
     _notifyError("notifyUpcomingDeadlines", e);
+  }
+}
+
+/**
+ * 定期実行：未着手・進行中の終日タスクのCalendar上の日付を今日に追従させる（Issue #50）
+ * 完了・キャンセルのタスクは対象外（過去の実績として日付を固定するため）。
+ */
+function advanceAllDayTaskDates() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    Logger.log("advanceAllDayTaskDates: ロック取得失敗（別の同期処理が実行中）スキップ");
+    return;
+  }
+  try {
+    _advanceAllDayTasksBody();
+  } catch(e) {
+    _notifyError("advanceAllDayTaskDates", e);
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -466,6 +486,63 @@ function _removeDeletedEvents(sheet, calendarEvents, eventIdToRow, calendarIds, 
   }
 }
 
+/**
+ * 未着手・進行中の終日タスク（B列が空欄）について、対応するCalendarイベントの開始日を
+ * 今日の日付に更新する。完了・キャンセルのタスクは対象外（Issue #50）。
+ * B列・C列などSheet側のデータは元々空欄のままなので書き込み不要。
+ */
+function _advanceAllDayTasksBody() {
+  const sheet   = _getOrCreateSheet();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < CONFIG.DATA_START_ROW) return;
+
+  const col      = CONFIG.COL;
+  const NUM_COLS = Object.keys(col).length;
+  const rows     = sheet.getRange(CONFIG.DATA_START_ROW, 1, lastRow - CONFIG.HEADER_ROW, NUM_COLS).getValues();
+
+  const calendarMap = _getAssigneeCalendarMap();
+  const allCalIds    = [...calendarMap.values()];
+  const today        = new Date();
+
+  let advancedCount = 0;
+
+  rows.forEach(function(rowData) {
+    const status = String(rowData[col.STATUS - 1]).trim();
+    if (status !== "未着手" && status !== "進行中") return;
+
+    const startVal = rowData[col.START - 1];
+    if (startVal) return; // 終日タスク（B列が空欄）のみ対象
+
+    const eventId = rowData[col.EVENT_ID - 1];
+    if (!eventId) return;
+
+    try {
+      const assignee      = String(rowData[col.ASSIGNEE - 1]).trim();
+      const preferredCalId = (assignee && calendarMap.has(assignee)) ? calendarMap.get(assignee) : null;
+
+      let ev = null;
+      if (preferredCalId) {
+        const cal = CalendarApp.getCalendarById(preferredCalId);
+        ev = cal ? cal.getEventById(eventId) : null;
+      }
+      if (!ev) {
+        const found = _findEventInCalendars(eventId, allCalIds);
+        ev = found ? found.event : null;
+      }
+      if (!ev || !ev.isAllDayEvent()) return;
+
+      if (_isSameDate(ev.getStartTime(), today)) return; // 既に今日なら何もしない
+
+      ev.setAllDayDate(today);
+      advancedCount++;
+    } catch(e) {
+      Logger.log("終日タスク日付追従失敗: eventId=" + eventId + " " + e.message);
+    }
+  });
+
+  Logger.log("終日タスク日付追従: " + advancedCount + "件更新");
+}
+
 // ==================== 内部関数 ====================
 
 /**
@@ -693,7 +770,7 @@ function _notifyUpcomingDeadlinesBody() {
 function _registerTriggers() {
   const triggers = ScriptApp.getProjectTriggers();
   triggers.forEach(function(t) {
-    if (["onEditTrigger", "syncCalendarToSheets", "notifyUpcomingDeadlines"].includes(t.getHandlerFunction())) {
+    if (["onEditTrigger", "syncCalendarToSheets", "notifyUpcomingDeadlines", "advanceAllDayTaskDates"].includes(t.getHandlerFunction())) {
       ScriptApp.deleteTrigger(t);
     }
   });
@@ -712,6 +789,12 @@ function _registerTriggers() {
     .timeBased()
     .everyDays(1)
     .atHour(9)
+    .create();
+
+  ScriptApp.newTrigger("advanceAllDayTaskDates")
+    .timeBased()
+    .everyDays(1)
+    .atHour(0)
     .create();
 }
 
@@ -929,6 +1012,15 @@ function _formatDateTime(date) {
   const h  = String(d.getHours()).padStart(2, "0");
   const mi = String(d.getMinutes()).padStart(2, "0");
   return y + "/" + mo + "/" + dy + " " + h + ":" + mi;
+}
+
+/**
+ * 2つのDateが年・月・日単位で同じ日かどうかを判定する（時刻は無視）
+ */
+function _isSameDate(a, b) {
+  return a.getFullYear() === b.getFullYear() &&
+         a.getMonth()    === b.getMonth()    &&
+         a.getDate()     === b.getDate();
 }
 
 /**
