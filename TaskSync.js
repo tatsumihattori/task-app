@@ -639,7 +639,7 @@ function _notifyUpcomingDeadlinesBody() {
   const limit = new Date(today.getTime() + CONFIG.CHAT_NOTIFY_DAYS_BEFORE * 24 * 60 * 60 * 1000);
 
   // 担当者ごとにタスクをまとめてから1人1メッセージで送る
-  const tasksByAssignee = new Map(); // assignee(表示名) -> [{ taskName, deadline, deadlineStr }]
+  const tasksByAssignee = new Map(); // assignee(表示名) -> [{ taskName, deadline, deadlineStr, overdue }]
 
   rows.forEach(function(rowData) {
     const status = String(rowData[col.STATUS - 1]);
@@ -651,7 +651,9 @@ function _notifyUpcomingDeadlinesBody() {
     if (isNaN(deadline.getTime())) return;
     deadline.setHours(0, 0, 0, 0);
 
-    if (deadline < today || deadline > limit) return;
+    // 期日超過（deadline < today）も通知対象に含める。上限（CHAT_NOTIFY_DAYS_BEFORE日先）のみで絞り込む。
+    // 完了/キャンセル以外は期日超過後も無期限に毎日通知され続ける（重複通知抑制なしの既存方針と整合。Issue #48）
+    if (deadline > limit) return;
 
     const taskName = rowData[col.TASK_NAME - 1];
     const assignee = String(rowData[col.ASSIGNEE - 1]).trim() || "(担当者未設定)";
@@ -661,6 +663,7 @@ function _notifyUpcomingDeadlinesBody() {
       taskName: taskName,
       deadline: deadline,
       deadlineStr: _formatDateOnly(deadline),
+      overdue: deadline < today,
     });
   });
 
@@ -670,10 +673,11 @@ function _notifyUpcomingDeadlinesBody() {
     const chatUserId = chatUserMap.get(assignee);
     const mention     = chatUserId ? "<" + chatUserId + ">" : assignee;
     const taskLines   = tasks.map(function(t) {
-      return "・" + t.taskName + "（期日: " + t.deadlineStr + "）";
+      const label = t.overdue ? "（期日超過: " + t.deadlineStr + "）" : "（期日: " + t.deadlineStr + "）";
+      return "・" + t.taskName + label;
     }).join("\n");
 
-    const text = "⏰ " + mention + " 期日が近づいているタスクがあります\n" + taskLines;
+    const text = "⏰ " + mention + " 期日が近い、または過ぎているタスクがあります\n" + taskLines;
 
     try {
       UrlFetchApp.fetch(webhookUrl, {
