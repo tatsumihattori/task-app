@@ -341,6 +341,10 @@ function _syncCalendarToSheetsBody() {
 
       Logger.log("色確認: [" + rawTitle + "] " + (resolvedBy ? resolvedBy + " → " + newStatus : "(未対応)"));
 
+      // Calendar側の色/ラベルが「キャンセル」と判定された場合、そのCalendarイベント自体を削除する
+      // （Sheets側で「キャンセル」にした場合の削除はSheets→Calendar側の _syncRowToCalendar で対応。Issue #44）
+      const isCancelledNow = newStatus === "キャンセル";
+
       if (eventIdToEntry.has(eventId)) {
         // ---- 既存行：差分チェック（読み取り済みデータを使用） ----
         const entry = eventIdToEntry.get(eventId);
@@ -349,6 +353,7 @@ function _syncCalendarToSheetsBody() {
         const statusChanged = newStatus !== null && String(d[col.STATUS - 1]) !== newStatus;
         const changed =
           statusChanged                                          ||
+          isCancelledNow                                          ||
           String(d[col.TASK_NAME - 1])          !== newTaskName ||
           _formatDateTime(d[col.START - 1])      !== newStart    ||
           _formatDateTime(d[col.END - 1])        !== newEnd      ||
@@ -365,9 +370,26 @@ function _syncCalendarToSheetsBody() {
           updated[col.MEMO - 1]       = memo;
           updated[col.LAST_SYNC - 1]  = syncTime;
           updated[col.UPDATED_BY - 1] = creator;
+          if (isCancelledNow) {
+            try {
+              event.deleteEvent();
+              Logger.log("キャンセル検知によりCalendarイベント削除: row=" + entry.rowNum + " eventId=" + eventId);
+            } catch (delErr) {
+              Logger.log("キャンセルイベント削除失敗: eventId=" + eventId + " " + delErr.message);
+            }
+            updated[col.EVENT_ID - 1] = "";
+          }
           pendingUpdates.push({ rowNum: entry.rowNum, values: updated });
           Logger.log("更新: row=" + entry.rowNum + " [" + newTaskName + "]" + (statusChanged ? " ステータス→" + newStatus : ""));
           updatedCount++;
+        }
+      } else if (isCancelledNow) {
+        // ---- 新規イベントだが既にキャンセル扱い：追跡する意味がないため行を追加せずイベントのみ削除する ----
+        try {
+          event.deleteEvent();
+          Logger.log("新規キャンセルイベントを削除（行は追加しない）: eventId=" + eventId);
+        } catch (delErr) {
+          Logger.log("新規キャンセルイベント削除失敗: eventId=" + eventId + " " + delErr.message);
         }
       } else {
         // ---- 新規行 ----
@@ -493,6 +515,17 @@ function _syncRowToCalendar(sheet, row, labelCache, calendarMap) {
       const preferredCalId = (assignee && calendarMap.has(assignee)) ? calendarMap.get(assignee) : null;
       _deleteEventAcrossCalendars(eventId, [...calendarMap.values()], preferredCalId);
       sheet.getRange(row, col.EVENT_ID).clearContent();
+    }
+    return;
+  }
+
+  // ステータスが「キャンセル」ならCalendarイベントを削除する（Sheet行自体は残す。Issue #44）
+  if (status === "キャンセル") {
+    if (eventId) {
+      const preferredCalId = (assignee && calendarMap.has(assignee)) ? calendarMap.get(assignee) : null;
+      _deleteEventAcrossCalendars(eventId, [...calendarMap.values()], preferredCalId);
+      sheet.getRange(row, col.EVENT_ID).clearContent();
+      Logger.log("キャンセルによりCalendarイベント削除: row=" + row);
     }
     return;
   }
