@@ -371,6 +371,12 @@ function _syncCalendarToSheetsBody() {
         }
       } else {
         // ---- 新規行 ----
+        // Calendar側で色/ラベルを指定せずに登録されたイベント（newStatus === null）は、
+        // Sheet側の初期値と同じ「未着手」の色・ラベルをCalendarイベント自体にも書き戻す（Issue #42）。
+        if (newStatus === null) {
+          _applyStatusColorAndLabel(event, eventId, sourceCalId, "未着手", null, labelNameCache);
+        }
+
         const newRow = new Array(NUM_COLS).fill("");
         newRow[col.TASK_NAME - 1]  = newTaskName;
         newRow[col.START - 1]      = newStart;
