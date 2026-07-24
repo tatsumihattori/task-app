@@ -10,6 +10,7 @@ Google Sheets と Google Calendar の双方向タスク同期システム。Goog
 - **Sheets → Calendar**: セル編集時に即座反映（`onEdit` インストーラブルトリガー）
 - **Calendar → Sheets**: 10分ごとのポーリングで反映（時間ベーストリガー）。スプレッドシートのカスタムメニュー「TaskSync」からも手動即時実行可能（`onOpen()` の simple trigger でメニュー登録、実体は `manualSyncCalendarToSheets()` → `_syncCalendarToSheetsBody()`。Issue #40）
 - **期日通知**: 期日が近いタスクをGoogle Chatに毎日通知（時間ベーストリガー、`notifyUpcomingDeadlines`）
+- **終日タスクの日付自動追従**: 未着手・進行中の終日タスクは、毎日0時の時間ベーストリガー（`advanceAllDayTaskDates`）でCalendar側の日付が今日に自動更新される。完了・キャンセルのタスクは対象外（Issue #50）
 
 ## シート構成
 
@@ -145,6 +146,8 @@ GASの CalendarApp 経由では、UIで手動変更したイベント色を `get
 **解決策**: 日付で範囲内外を判断できない行（終日タスク、およびフォーマット不正行）に限り、既存の`_findEventInCalendars()`（`getEventById`ベースで日付に縛られない直接検索。担当者変更時の旧イベント検索や`resetAndResyncToCalendar`で既に使われているのと同じ仕組み）で実在確認するようフォールバックさせた。見つかれば「範囲外なだけでまだ存在する」として削除しない、見つからなければ本当に削除されたと判断して行を削除する。
 
 → **同期範囲の内外判定にB列の日付だけを当てにできないケース（終日タスク・フォーマット不正）が出てきたら、まずこのフォールバックとその周辺を疑うこと。**
+
+**Issue #50との関係**: 上記の「長期間編集されていない終日タスクほど古い日付のまま止まる」という前提は、未着手・進行中の終日タスクについては`advanceAllDayTaskDates`（毎日0時）が編集の有無に関わらず日付を今日に追従させることで実質的に解消された。ただし完了・キャンセルのタスクは`advanceAllDayTaskDates`の対象外（意図的に日付を固定する）ため、それらについては引き続き古い日付のまま止まりうる。したがって本項目の`_findEventInCalendars`フォールバックは完了・キャンセルの終日タスクのために今後も必要。
 
 ### 6. Calendar新UIの「ラベル」機能により`colorId`だけでの手動変更検知が不完全になっていた（Issue #32で対応済み）
 
