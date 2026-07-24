@@ -25,9 +25,9 @@ Google Sheets と Google Calendar の双方向タスク同期システム。Goog
 | H | 最終同期日時 | 自動管理。バリデーションエラー時は警告文字列を書き込む |
 | I | 作成者 | 自動管理 |
 | J | 最終更新者 | 自動管理 |
-| K | プロジェクト名 | Calendarイベント説明欄に表示 |
-| L | 期日 | Google Chat期日通知に使用（`CHAT_NOTIFY_DAYS_BEFORE`日前から当日まで毎日通知。完了/キャンセルは通知対象外）。Calendarイベント説明欄にも表示 |
-| M | 取引先 | Calendarイベント説明欄に表示 |
+| K | プロジェクト名 | Calendarイベント説明欄に表示。Calendar側での変更も同期される（双方向。Issue #46） |
+| L | 期日 | Google Chat期日通知に使用（`CHAT_NOTIFY_DAYS_BEFORE`日前から当日まで毎日通知。完了/キャンセルは通知対象外）。Calendarイベント説明欄にも表示。Calendar側での変更も同期される（双方向。Issue #46） |
+| M | 取引先 | Calendarイベント説明欄に表示。Calendar側での変更も同期される（双方向。Issue #46） |
 
 カレンダー側のイベントタイトル形式: **タスク名のみ**（ステータス・担当者はタイトルに含めない）
 説明欄は「プロジェクト/取引先/期日」ブロック（いずれか入力されている場合のみ）＋メモ。詳細は「Calendarイベント説明欄の構成」参照。
@@ -79,9 +79,9 @@ C列は `_getAssigneeChatUserMap()` で読み込み、Google Chat期日通知で
 {メモ本文}
 ```
 
-Calendar→Sheets同期（`_syncCalendarToSheetsBody`）は `_extractMemoFromDescription()` で区切り文字より後ろだけを抜き出してF列（メモ）に書き戻す。**プロジェクト/取引先/期日の3項目はSheets→Calendarの一方向のみ**（Calendar側で説明欄の先頭ブロックを直接編集しても、K/L/M列には反映されない）。
+Calendar→Sheets同期（`_syncCalendarToSheetsBody`）は `_extractMemoFromDescription()` で区切り文字より後ろだけを抜き出してF列（メモ）に書き戻す。区切り文字が見つからない場合（区切り文字を追加する前に作られた既存イベント、またはCalendar側で区切り文字自体を消してしまった場合）は、説明欄全体をメモとして扱う後方互換フォールバックになっている。
 
-区切り文字が見つからない場合（区切り文字を追加する前に作られた既存イベント、またはCalendar側で区切り文字自体を消してしまった場合）は、説明欄全体をメモとして扱う後方互換フォールバックになっている。
+**プロジェクト/取引先/期日の3項目もCalendar→Sheetsに反映される**（双方向。Issue #46で対応）。`_extractProjectClientDeadlineFromDescription()` が区切り文字より前のヘッダーブロックから「プロジェクト: 」「取引先: 」「期日: 」の各行を正規表現で抽出し、`_syncCalendarToSheetsBody` がK/L/M列との差分を検出して更新する。区切り文字自体が見つからない場合（区切り文字追加前の既存イベント、または手動でメモのみに書き換えられた場合）は判定不能として `null` を返し、K/L/M列は更新しない（誤って空欄化しないための後方互換）。区切り文字はあるがヘッダー内の特定の行が無い場合は、その項目がCalendar側で削除されたとみなし該当列を空にする。
 
 ## ステータスとカレンダーイベント色の対応
 

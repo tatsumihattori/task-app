@@ -315,8 +315,16 @@ function _syncCalendarToSheetsBody() {
       const newStart    = event.isAllDayEvent() ? "" : _formatDateTime(event.getStartTime());
       const newEnd      = event.isAllDayEvent() ? "" : _formatDateTime(event.getEndTime());
       const assignee    = calIdToAssignee.get(sourceCalId) || "";
-      const memo        = _sanitizeForSheet(_extractMemoFromDescription(event.getDescription() || "").trim());
+      const description = event.getDescription() || "";
+      const memo        = _sanitizeForSheet(_extractMemoFromDescription(description).trim());
       const creator     = event.getCreators()[0] || "Calendar";
+      // プロジェクト/取引先/期日: 区切り文字が見つかった場合のみヘッダーブロックとして解析する。
+      // 見つからない場合（区切り文字追加前の既存イベント、または手動でメモのみに書き換えられた場合）は
+      // null を返し、K/L/M列への反映をスキップする（誤って空欄化しないための後方互換フォールバック）。
+      const headerFields   = _extractProjectClientDeadlineFromDescription(description);
+      const newProject     = headerFields ? _sanitizeForSheet(headerFields.project) : null;
+      const newClient      = headerFields ? _sanitizeForSheet(headerFields.client)  : null;
+      const newDeadlineStr = headerFields ? headerFields.deadline : null; // "" または "YYYY/MM/DD"
       // ステータス判定: まずCalendarApp（追加API呼び出し不要）の色で判定を試みる。
       // 判定できない場合のみ Advanced Service で colorId と eventLabelId をまとめて取得する。
       // eventLabelId はCalendarの「ラベル」機能に対応し、UIでの手動変更を確実に反映するため colorId より優先する
@@ -346,9 +354,15 @@ function _syncCalendarToSheetsBody() {
         const entry = eventIdToEntry.get(eventId);
         const d     = entry.data;
 
-        const statusChanged = newStatus !== null && String(d[col.STATUS - 1]) !== newStatus;
+        const statusChanged   = newStatus !== null && String(d[col.STATUS - 1]) !== newStatus;
+        const projectChanged  = newProject     !== null && String(d[col.PROJECT - 1])     !== newProject;
+        const clientChanged   = newClient      !== null && String(d[col.CLIENT - 1])      !== newClient;
+        const deadlineChanged = newDeadlineStr !== null && _formatDateOnly(d[col.DEADLINE - 1]) !== newDeadlineStr;
         const changed =
           statusChanged                                          ||
+          projectChanged                                         ||
+          clientChanged                                          ||
+          deadlineChanged                                        ||
           String(d[col.TASK_NAME - 1])          !== newTaskName ||
           _formatDateTime(d[col.START - 1])      !== newStart    ||
           _formatDateTime(d[col.END - 1])        !== newEnd      ||
@@ -363,6 +377,9 @@ function _syncCalendarToSheetsBody() {
           updated[col.END - 1]        = newEnd;
           updated[col.ASSIGNEE - 1]   = assignee;
           updated[col.MEMO - 1]       = memo;
+          if (newProject !== null) updated[col.PROJECT - 1] = newProject;
+          if (newClient  !== null) updated[col.CLIENT  - 1] = newClient;
+          if (newDeadlineStr !== null) updated[col.DEADLINE - 1] = newDeadlineStr ? _parseDateOnly(newDeadlineStr) : "";
           updated[col.LAST_SYNC - 1]  = syncTime;
           updated[col.UPDATED_BY - 1] = creator;
           pendingUpdates.push({ rowNum: entry.rowNum, values: updated });
@@ -382,6 +399,9 @@ function _syncCalendarToSheetsBody() {
         newRow[col.LAST_SYNC - 1]  = syncTime;
         newRow[col.CREATED_BY - 1] = creator;
         newRow[col.UPDATED_BY - 1] = creator;
+        if (newProject) newRow[col.PROJECT - 1]  = newProject;
+        if (newClient)  newRow[col.CLIENT - 1]   = newClient;
+        if (newDeadlineStr) newRow[col.DEADLINE - 1] = _parseDateOnly(newDeadlineStr);
         pendingNewRows.push(newRow);
         addedCount++;
       }
@@ -977,4 +997,37 @@ function _extractMemoFromDescription(description) {
   const idx = description.indexOf(_DESCRIPTION_MEMO_DELIMITER);
   if (idx === -1) return description;
   return description.slice(idx + _DESCRIPTION_MEMO_DELIMITER.length);
+}
+
+/**
+ * Calendarイベントの説明欄からプロジェクト名・取引先・期日（文字列）を取り出す
+ * （`_buildEventDescription` の逆変換。Issue #46）。
+ * 区切り文字が見つからない場合（区切り文字追加前の既存イベント、または手動でメモのみに
+ * 書き換えられた場合）は null を返す。呼び出し側はこの場合K/L/M列への反映をスキップし、
+ * 誤って値を空欄化しないようにする。
+ * 区切り文字が見つかった場合、各行（プロジェクト/取引先/期日）は存在すればその値、
+ * 存在しなければ空文字（＝Calendar側でその項目が削除された）を返す。
+ */
+function _extractProjectClientDeadlineFromDescription(description) {
+  const idx = description.indexOf(_DESCRIPTION_MEMO_DELIMITER);
+  if (idx === -1) return null;
+  const header       = description.slice(0, idx);
+  const projectMatch  = header.match(/^プロジェクト:\s?(.*)$/m);
+  const clientMatch   = header.match(/^取引先:\s?(.*)$/m);
+  const deadlineMatch = header.match(/^期日:\s?(.*)$/m);
+  return {
+    project:  projectMatch  ? projectMatch[1].trim()  : "",
+    client:   clientMatch   ? clientMatch[1].trim()   : "",
+    deadline: deadlineMatch ? deadlineMatch[1].trim() : "",
+  };
+}
+
+/**
+ * "YYYY/MM/DD"（または "YYYY-MM-DD"）形式の日付のみの文字列を Date に変換する。
+ * `_sheetDateToCalendarDate` の日付のみ版（時刻を含まない）。パースできない場合は null。
+ */
+function _parseDateOnly(str) {
+  const m = String(str).match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (!m) return null;
+  return new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
 }
